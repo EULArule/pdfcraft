@@ -304,8 +304,13 @@ impl<'a, 'b> Runner<'a, 'b> {
 
     /// The script engine for this event.
     fn session(&mut self) -> &mut XfaSession {
-        let doc_info = XfaDoc { file_name: String::new(), page: 0, page_count: self.run.page_count };
-        self.session.get_or_insert_with(|| XfaSession::new(doc_info))
+        if self.session.is_none() {
+            let script_objects = self.tpl.script_objects.iter().filter(|o| !o.formcalc).map(|o| (o.name.clone(), o.text.clone())).collect();
+            let doc_info =
+                XfaDoc { file_name: String::new(), page: 0, page_count: self.run.page_count, script_objects: std::sync::Arc::new(script_objects) };
+            self.session = Some(XfaSession::new(doc_info));
+        }
+        self.session.get_or_insert_with(|| XfaSession::new(XfaDoc::default()))
     }
 
     /// Give the object at `som` the value `text` in the data and in the live form (refreshed
@@ -668,6 +673,27 @@ impl<'a, 'b> Runner<'a, 'b> {
         Ok(())
     }
 
+    /// The layout-ready scripts (`<event activity="ready" ref="$layout">`), which run once the
+    /// form is laid out: page numbers and counts, row numbers. They see the page count the
+    /// layout has now. Run once per event, after the calculations; what they change does not
+    /// run them again.
+    fn layout_ready(&mut self) -> Result<(), String> {
+        let events: Vec<ScriptEvent> = self.live().events.iter().filter(|e| e.activity == "ready").cloned().collect();
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.flush()?;
+        if let Some(pages) = pdfcraft_xfa::existing_layout(self.doc).map(|l| l.pages).filter(|p| *p > 0 && *p != self.run.page_count) {
+            self.run.page_count = pages;
+            // The script engine holds the page count it was made with.
+            self.session = None;
+        }
+        for ev in &events {
+            self.run(ev, "")?;
+        }
+        Ok(())
+    }
+
     fn events_of(&mut self, som: &str, activity: &str) -> Vec<ScriptEvent> {
         self.live().events.iter().filter(|e| e.som == som && e.activity == activity).cloned().collect()
     }
@@ -745,6 +771,7 @@ pub(crate) fn on_open(doc: &mut pdfcraft_cos::Document, tpl: &Template, run: &mu
         r.run(ev, "")?;
     }
     r.calculates()?;
+    r.layout_ready()?;
     r.finish()
 }
 
@@ -769,6 +796,7 @@ pub(crate) fn on_changes(doc: &mut pdfcraft_cos::Document, tpl: &Template, names
         }
     }
     r.calculates()?;
+    r.layout_ready()?;
     r.finish().map(|_| ())
 }
 
@@ -779,6 +807,7 @@ pub(crate) fn on_data_replaced(doc: &mut pdfcraft_cos::Document, tpl: &Template,
     r.relayout()?;
     if calculate {
         r.calculates()?;
+        r.layout_ready()?;
     }
     r.finish().map(|_| ())
 }
@@ -796,6 +825,7 @@ pub(crate) fn on_event(doc: &mut pdfcraft_cos::Document, tpl: &Template, som: &s
     // The calculations that follow get a budget of their own.
     r.clock = Clock::start(OPEN_BUDGET_MS);
     r.calculates()?;
+    r.layout_ready()?;
     r.finish().map(|_| ())
 }
 

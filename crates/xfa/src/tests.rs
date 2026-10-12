@@ -1039,7 +1039,7 @@ fn pictures_are_embedded_once_across_relayouts_and_bad_data_pictures_are_reporte
     assert!(!root.as_dict().unwrap().contains(b"PCXfaImages"));
     // Pictures in the data that aren't pictures: a warning naming the field, the template's
     // picture shown instead.
-    for (data, what) in [("Qk0AAAAA", "not a JPEG, PNG or GIF"), ("not base64!", "not base64")] {
+    for (data, what) in [("Qk0AAAAA", "not a JPEG, PNG, GIF or BMP"), ("not base64!", "not base64")] {
         let tpl = fields_template(&format!("<form><page1><photo>{data}</photo></page1></form>"));
         let form = layout_xml(&tpl).unwrap();
         assert!(form.warnings.iter().any(|w| w.contains("photo") && w.contains(what)), "{what}: {:?}", form.warnings);
@@ -1787,4 +1787,157 @@ fn imported_data_is_written_with_the_packets_own_prefix_and_never_leaves_it_unre
     );
     let form = layout_xml(&many).unwrap();
     assert!(form.warnings.iter().any(|w| w.contains("60 rows") && w.contains("first 50")), "{:?}", form.warnings);
+}
+
+/// The decoded content stream and the font resources of a rendered form's first page.
+fn first_page(doc: &Document) -> (String, pdfcraft_cos::Dict) {
+    let catalog = doc.get(doc.root().unwrap());
+    let pages = doc.resolve(catalog.as_dict().unwrap().get(b"Pages").unwrap());
+    let kids = doc.resolve(pages.as_dict().unwrap().get(b"Kids").unwrap());
+    let page = doc.resolve(&kids.as_array().unwrap()[0]);
+    let page = page.as_dict().unwrap();
+    let Object::Stream(content) = &*doc.resolve(page.get(b"Contents").unwrap()) else { panic!("no content") };
+    let resources = doc.resolve(page.get(b"Resources").unwrap());
+    let fonts = doc.resolve(resources.as_dict().unwrap().get(b"Font").unwrap());
+    (String::from_utf8_lossy(&content.decoded().unwrap()).into_owned(), fonts.as_dict().unwrap().clone())
+}
+
+/// The Latin letters WinAnsiEncoding lacks are in the standard fonts all the same, and are
+/// written through a second encoding, not as `?`.
+#[test]
+fn latin_letters_outside_win_ansi_are_drawn_through_the_extended_encoding() {
+    let xdp = r##"<?xml version="1.0" encoding="UTF-8"?>
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/"><template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">
+<draw w="5in" h="0.3in"><font typeface="Times New Roman" size="9pt"/><value><text>DECLARAŢIE privind țara și județul în cauză</text></value></draw>
+</subform></template></xdp:xdp>"##;
+    let mut doc = Document::open(Arc::new(shell(xdp))).unwrap();
+    let report = render_into(&mut doc).unwrap();
+    assert!(!report.warnings.iter().any(|w| w.contains("standard fonts")), "{:?}", report.warnings);
+    let (content, fonts) = first_page(&doc);
+    assert!(content.contains("/TiRo 9 Tf") && content.contains("/TiRoX 9 Tf"), "{content}");
+    assert!(!content.contains('?'), "nothing is replaced: {content}");
+    // The second font is the same face, its encoding naming the glyphs, with what they mean.
+    let ext = doc.resolve(fonts.get(b"TiRoX").unwrap());
+    let ext = ext.as_dict().unwrap();
+    assert_eq!(ext.name(b"BaseFont"), Some(&b"Times-Roman"[..]));
+    let m = pdfcraft_fonts::pdf::Metrics::from_dict(&doc, ext);
+    let codes: Vec<u8> = "Ţțș".chars().map(|c| pdfcraft_fonts::standard14::extended_code(c).unwrap()).collect();
+    assert_eq!(m.decode(&codes), "Ţțș");
+    // â and î are WinAnsi's and stay in the first font; what no standard font has is still
+    // reported and shown as `?`.
+    let mut doc = Document::open(Arc::new(shell(&xdp.replace("DECLARAŢIE privind țara și județul în cauză", "în câmp")))).unwrap();
+    render_into(&mut doc).unwrap();
+    assert!(!first_page(&doc).0.contains("TiRoX"));
+    let mut doc = Document::open(Arc::new(shell(&xdp.replace("DECLARAŢIE", "申")))).unwrap();
+    assert!(render_into(&mut doc).unwrap().warnings.iter().any(|w| w.contains("\"申\" (U+7533)")));
+}
+
+/// `anchorType` says which point of the box `x` and `y` give; a field without a
+/// width is `minW` wide; a caption reserve of zero means "what the caption needs"; a comb keeps
+/// its cells; a field that must be filled in is required.
+#[test]
+fn anchors_min_widths_auto_caption_reserves_and_combs_are_laid_out_as_designed() {
+    let xml = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" w="500pt" h="300pt">
+<draw anchorType="topCenter" x="200pt" y="10pt" w="100pt" h="20pt"><value><text>Period</text></value></draw>
+<draw anchorType="bottomRight" x="500pt" y="60pt" w="100pt" h="20pt"><value><text>Corner</text></value></draw>
+<field name="phone" x="10pt" y="80pt" minW="100pt" h="20pt"><ui><textEdit/></ui></field>
+<field name="fax" x="120pt" y="80pt" w="90pt" h="20pt"><ui><textEdit/></ui></field>
+<field name="sign" x="10pt" y="120pt" w="200pt" h="60pt"><ui><signature/></ui><caption placement="bottom" reserve="0mm"><value><text>Signature</text></value></caption></field>
+<field name="year" x="10pt" y="200pt" w="80pt" h="20pt"><ui><numericEdit><comb numberOfCells="4"/></numericEdit></ui><validate nullTest="error"/></field>
+<field name="total" x="10pt" y="230pt" w="400pt" minH="12pt"><ui><numericEdit/></ui><caption reserve="300pt"><value><text>A caption that fits its reserve on one line</text></value></caption></field>
+</subform></template>"##;
+    let form = layout_xml(xml).unwrap();
+    let page = &form.pages[0];
+    let origin = page
+        .items
+        .iter()
+        .find_map(|i| if let Item::Widget(w) = i { (w.name == "phone").then_some((w.rect.x - 10.0, w.rect.y - 80.0)) } else { None })
+        .unwrap();
+    let span =
+        |text: &str| page.items.iter().find_map(|i| if let Item::Text(s) = i { (s.text.trim() == text).then_some(s.clone()) } else { None }).unwrap();
+    // The centred box runs from 150 to 250, the bottom-right one ends at 500 and at y 60.
+    assert!((span("Period").x - origin.0 - 150.0).abs() < 0.01, "{}", span("Period").x);
+    let corner = span("Corner");
+    assert!((corner.x - origin.0 - 400.0).abs() < 0.01 && corner.baseline - origin.1 > 40.0 && corner.baseline - origin.1 < 60.0, "{corner:?}");
+    let ws = widgets(page);
+    let w = |name: &str| *ws.iter().find(|w| w.name == name).unwrap();
+    // The empty field is as wide as its `minW`, so it ends before its neighbour starts.
+    assert!((w("phone").rect.w - 100.0).abs() < 0.01 && w("phone").rect.right() < w("fax").rect.x);
+    // The caption sits inside the field's box, under the signature box.
+    let caption = span("Signature");
+    let sign = w("sign").rect;
+    assert!(sign.h < 60.0 && sign.h > 40.0, "{sign:?}");
+    assert!(caption.baseline > sign.bottom() && caption.baseline < sign.y + 60.0, "{caption:?} {sign:?}");
+    assert_eq!((w("year").comb, w("phone").comb), (Some(4), None));
+    // A caption beside its field wraps in its reserve, not in what the field has left.
+    assert!(w("total").rect.h < 20.0, "one line: {:?}", w("total").rect);
+    // The comb reaches the PDF field: the flag, and as many characters as cells.
+    let mut doc =
+        Document::open(Arc::new(shell(&format!("<?xml version=\"1.0\"?><xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\">{xml}</xdp:xdp>")))).unwrap();
+    render_into(&mut doc).unwrap();
+    let year = top_fields(&doc).into_iter().find(|(n, _)| n == "year").unwrap().1;
+    assert_eq!((year.int(b"Ff").unwrap_or(0) & (1 << 24), year.int(b"MaxLen")), (1 << 24, Some(4)));
+    // A field that must be filled in (`nullTest="error"`) is a required field, so viewers
+    // that highlight fields mark it; the others are not.
+    assert!(w("year").required && !w("phone").required);
+    assert_eq!(year.int(b"Ff").unwrap_or(0) & 2, 2);
+    let phone = top_fields(&doc).into_iter().find(|(n, _)| n == "phone").unwrap().1;
+    assert_eq!(phone.int(b"Ff").unwrap_or(0) & 2, 0);
+}
+
+/// An 8-bit BMP of `w` by `h` pixels with a two-colour palette, its rows bottom up; the file
+/// header's pixel offset as given (Designer writes zero).
+fn tiny_bmp(w: u32, h: u32, pixel_offset: u32, pixels: &[u8]) -> Vec<u8> {
+    let mut out = b"BM".to_vec();
+    out.extend_from_slice(&[0; 8]);
+    out.extend_from_slice(&pixel_offset.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes());
+    out.extend_from_slice(&[1, 0, 8, 0]);
+    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    // Blue, green, red, reserved: red then white.
+    out.extend_from_slice(&[0, 0, 255, 0, 255, 255, 255, 0]);
+    out.extend_from_slice(pixels);
+    out
+}
+
+/// BMP pictures are decoded, including those whose file header gives no pixel offset.
+#[test]
+fn bmp_pictures_are_decoded_even_without_a_pixel_offset() {
+    // Two rows of two pixels, each padded to four bytes; the bottom row first.
+    let pixels = [1, 0, 0, 0, 0, 1, 0, 0];
+    for offset in [0, 14 + 40 + 8] {
+        let bmp = tiny_bmp(2, 2, offset, &pixels);
+        assert_eq!(crate::image::kind(&bmp), Some(crate::image::Kind::Bmp));
+        assert_eq!(crate::image::size(&bmp), Some((2, 2)));
+        let img = crate::image::decode(&bmp).unwrap();
+        assert_eq!((img.width, img.height, img.color_space), (2, 2, "DeviceRGB"));
+        assert_eq!(img.samples, [255, 0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0], "top row first");
+        assert!(img.alpha.is_none());
+    }
+    // It is laid out and embedded like any picture.
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tiny_bmp(2, 2, 0, &pixels));
+    let xdp = format!(
+        r##"<?xml version="1.0"?><xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/"><template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">
+<draw w="1in" h="1in"><value><image contentType="image/bmp">{b64}</image></value></draw></subform></template></xdp:xdp>"##
+    );
+    let mut doc = Document::open(Arc::new(shell(&xdp))).unwrap();
+    let report = render_into(&mut doc).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(first_page(&doc).0.contains(" Do"), "the picture is drawn");
+    // Text that starts with "BM" is no picture; cut-short files, offsets past the end and
+    // absurd sizes are refused or decoded short, never a crash or a huge allocation.
+    assert_eq!(crate::image::kind(b"BMW owners club, a long enough text"), None);
+    let _ = crate::image::decode(&tiny_bmp(2, 2, 0, &[]));
+    let _ = crate::image::decode(&tiny_bmp(2, 2, u32::MAX, &pixels));
+    for cut in 0..tiny_bmp(2, 2, 0, &pixels).len() {
+        let _ = crate::image::decode(&tiny_bmp(2, 2, 0, &pixels)[..cut]);
+    }
+    let huge = tiny_bmp(60_000, 60_000, 0, &pixels);
+    assert_eq!(crate::image::size(&huge), None);
+    assert!(crate::image::decode(&huge).unwrap_err().contains("million pixels"));
+    assert!(crate::image::decode(&tiny_bmp(u32::MAX, 2, 0, &pixels)).is_err());
 }

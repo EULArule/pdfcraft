@@ -117,6 +117,10 @@ pub struct Widget {
     pub h_align: HAlign,
     pub multiline: bool,
     pub max_chars: Option<usize>,
+    /// A comb of this many cells.
+    pub comb: Option<usize>,
+    /// The field must be filled in.
+    pub required: bool,
     pub read_only: bool,
     pub border: WidgetBorder,
     /// The field's value: saved (bound) values for choice lists, newline-separated when several.
@@ -904,7 +908,11 @@ impl Layouter<'_> {
                     let inner = (avail_w - c.margin.horizontal()).max(1.0);
                     (self.content_width(node, inner, &ctx, depth) + c.margin.horizontal()).min(avail_w)
                 }
-                Node::Field(_) | Node::Draw(_) => avail_w,
+                // A leaf without a width grows from its `minW` with its content: an empty
+                // field is `minW` wide, text is as wide as its longest line.
+                Node::Field(_) => c.min_w.unwrap_or(avail_w),
+                Node::Draw(d) if c.min_w.is_some() => (self.value_width(&d.value, &ctx.child(c)) + c.margin.horizontal()).min(avail_w),
+                Node::Draw(_) => avail_w,
             },
         };
         let w = clamp_opt(w, c.min_w, c.max_w);
@@ -977,11 +985,25 @@ impl Layouter<'_> {
                 let sum: f64 = visible.map(|k| self.size_of(k, avail_w, ctx, depth + 1).0).sum();
                 if sum <= avail_w + 0.05 { sum } else { avail_w }
             }
-            Layout::Positioned => {
-                visible.map(|k| k.common().x.unwrap_or(0.0) + self.size_of(k, avail_w, ctx, depth + 1).0).fold(0.0, f64::max).min(avail_w)
-            }
+            Layout::Positioned => visible
+                .map(|k| {
+                    let (w, h) = self.size_of(k, avail_w, ctx, depth + 1);
+                    k.common().x.unwrap_or(0.0) - k.common().anchor.offset(w, h).0 + w
+                })
+                .fold(0.0, f64::max)
+                .min(avail_w),
             Layout::Tb | Layout::Table => visible.map(|k| self.size_of(k, avail_w, ctx, depth + 1).0).fold(0.0, f64::max).min(avail_w),
         }
+    }
+
+    /// The width a value's text takes unwrapped (zero for anything else).
+    fn value_width(&self, v: &Value, ctx: &Ctx) -> f64 {
+        let rich = match v {
+            Value::Text(t) => text::plain(t),
+            Value::Rich(r) => r.clone(),
+            _ => return 0.0,
+        };
+        text::natural_width(&rich, &ctx.para, &Face::of(&ctx.font), &|id| self.embed(id))
     }
 
     fn value_height(&self, v: &Value, w: f64, ctx: &Ctx) -> f64 {
@@ -1032,7 +1054,8 @@ impl Layouter<'_> {
                         Value::Rich(r) => r.clone(),
                         other => text::plain(&other.plain().unwrap_or_default()),
                     };
-                    text::measure_height(&rich, (inner_w - r).max(1.0), &ctx.para.apply(&c.para), &Face::of(&ctx.font.apply(&c.font)), &|id| {
+                    // Beside the field, the caption has its reserve to wrap in.
+                    text::measure_height(&rich, r.min(inner_w).max(1.0), &ctx.para.apply(&c.para), &Face::of(&ctx.font.apply(&c.font)), &|id| {
                         self.embed(id)
                     })
                 });
@@ -1076,8 +1099,8 @@ impl Layouter<'_> {
             .filter(|k| k.common().presence.occupies())
             .map(|k| {
                 let c = k.common();
-                let (_, h) = self.size_of(k, (inner_w - c.x.unwrap_or(0.0)).max(1.0), ctx, depth + 1);
-                c.y.unwrap_or(0.0) + h
+                let (w, h) = self.size_of(k, (inner_w - c.x.unwrap_or(0.0)).max(1.0), ctx, depth + 1);
+                c.y.unwrap_or(0.0) - c.anchor.offset(w, h).1 + h
             })
             .fold(0.0, f64::max)
     }
@@ -1175,7 +1198,9 @@ impl Layouter<'_> {
         }
         let (x, y) = (c.x.unwrap_or(0.0), c.y.unwrap_or(0.0));
         let (w, h) = self.size_of(k, (inner.w - x).max(1.0), ctx, depth + 1);
-        self.draw_node(k, Rect::new(inner.x + x, inner.y + y, w, h), ctx, depth + 1, sib)
+        // `x` and `y` give the anchor point, which need not be the top left corner.
+        let (dx, dy) = c.anchor.offset(w, h);
+        self.draw_node(k, Rect::new(inner.x + x - dx, inner.y + y - dy, w, h), ctx, depth + 1, sib)
     }
 
     fn draw_node(&mut self, node: &Node, rect: Rect, ctx: &Ctx, depth: usize, sib: usize) -> Result<(), XfaError> {
@@ -1504,7 +1529,7 @@ impl Layouter<'_> {
                     match base64::engine::general_purpose::STANDARD.decode(&text) {
                         Ok(d) if crate::image::kind(&d).is_some() => Some(d),
                         Ok(_) => {
-                            self.warn_once(format!("{field_name}: the picture in the data is not a JPEG, PNG or GIF and is left out"));
+                            self.warn_once(format!("{field_name}: the picture in the data is not a JPEG, PNG, GIF or BMP and is left out"));
                             None
                         }
                         Err(_) => {
@@ -1662,6 +1687,8 @@ impl Layouter<'_> {
             h_align,
             multiline: f.multiline,
             max_chars: f.max_chars,
+            comb: f.comb.filter(|_| matches!(f.ui, Ui::TextEdit | Ui::NumericEdit) && !f.multiline),
+            required: f.required && f.ui != Ui::Button,
             read_only,
             border,
             value,

@@ -84,6 +84,9 @@ pub struct XfaDoc {
     /// The current page, 0-based.
     pub page: usize,
     pub page_count: usize,
+    /// The form's JavaScript script objects, name and source: every script can call their
+    /// functions as `name.function()`. Each is evaluated when a script first names it.
+    pub script_objects: std::sync::Arc<Vec<(String, String)>>,
 }
 
 /// Something a script changed or asked for.
@@ -887,6 +890,12 @@ fn node_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         "resolveNode" => resolver(ctx, idx, false)?,
         "resolveNodes" => resolver(ctx, idx, true)?,
         "recalculate" => function(ctx, NativeFunction::from_fn_ptr(recalculate)).into(),
+        // `event.target` is the node here and the document in Acrobat: what forms ask the
+        // document for. Attachments are not reachable from a form's scripts.
+        "resetForm" => function(ctx, NativeFunction::from_fn_ptr(doc_reset_form)).into(),
+        "dataObjects" => JsValue::null(),
+        "removeDataObject" => function(ctx, NativeFunction::from_fn_ptr(noop)).into(),
+        "createDataObject" | "importDataObject" | "exportDataObject" => function(ctx, NativeFunction::from_fn_ptr(data_object_unsupported)).into(),
         "remerge" => function(ctx, NativeFunction::from_fn_ptr(relayout)).into(),
         "getAttribute"
         | "setAttribute"
@@ -1089,6 +1098,93 @@ fn layout_page_count(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<
     Ok(JsValue::from(host(ctx)?.borrow().doc.page_count as f64))
 }
 
+/// `xfa.layout.pageContent(page, className)`: the objects of that class on the page. The form
+/// tree doesn't record which page an object landed on, so the first page answers for the whole
+/// form and the others hold nothing: a script that walks every page meets each object once.
+fn layout_page_content(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let page = arg(args, 0).to_number(ctx)?;
+    let class = match arg(args, 1) {
+        v if v.is_undefined() || v.is_null() => String::new(),
+        v => text(&v, ctx)?,
+    };
+    let items: Vec<usize> = if page == 0.0 {
+        let h = host(ctx)?.borrow();
+        h.nodes.iter().enumerate().filter(|(_, n)| !n.gone && (class.is_empty() || n.kind.class_name() == class)).map(|(i, _)| i).collect()
+    } else {
+        Vec::new()
+    };
+    list_object(ctx, &items)
+}
+
+/// `event.target.resetForm(names)`: in Acrobat an XFA script's `event.target` is the document,
+/// and forms reset fields through it. The names are SOM paths; none resets every field.
+fn doc_reset_form(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let list = arg(args, 0);
+    let mut names = Vec::new();
+    if let Some(o) = list.as_object() {
+        let len = o.get(js_string!("length"), ctx)?.to_number(ctx)?;
+        let len = if len.is_finite() && len > 0.0 { len.min(1000.0) as u32 } else { 0 };
+        for i in 0..len {
+            let v = o.get(i, ctx)?;
+            if !v.is_undefined() && !v.is_null() {
+                names.push(text(&v, ctx)?);
+            }
+        }
+        if names.is_empty() {
+            // A list naming nothing resets nothing (not everything).
+            return Ok(JsValue::undefined());
+        }
+    } else if !list.is_undefined() && !list.is_null() {
+        names.push(text(&list, ctx)?);
+    }
+    effect(ctx, XfaEffect::ResetData(names))?;
+    Ok(JsValue::undefined())
+}
+
+/// `event.target.createDataObject(name, text)` and its kin: a form attaching a file it made (a
+/// report, the data as XML) to the document. Not done yet; said in the console, never silently.
+fn data_object_unsupported(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = clip(text(&arg(args, 0), ctx)?);
+    host(ctx)?.borrow_mut().print(format!(
+        "The form asked to attach or read the file \"{name}\"; PdfCraft does not let a form's scripts do that yet, so it was not done"
+    ));
+    Ok(JsValue::from(false))
+}
+
+/// Evaluates each script object when a script first names it, in a scope of its own: its
+/// functions and variables are reached through the object, as `name.function()`.
+const SCRIPT_OBJECTS: &[u8] = br#"(function (g, sources) {
+    function load(__xfa_source) {
+        eval(__xfa_source);
+        return function (__xfa_name) {
+            try { return eval(__xfa_name); } catch (e) { return undefined; }
+        };
+    }
+    var identifier = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+    Object.keys(sources).forEach(function (name) {
+        if (name in g) { return; }
+        var made, look;
+        Object.defineProperty(g, name, {
+            configurable: true,
+            get: function () {
+                if (made === undefined) {
+                    var own = {};
+                    made = new Proxy(own, {
+                        get: function (t, p) {
+                            if (typeof p !== "string") { return undefined; }
+                            if (p in t) { return t[p]; }
+                            if (!look || !identifier.test(p) || p.indexOf("__xfa_") === 0) { return undefined; }
+                            return look(p);
+                        }
+                    });
+                    look = load(sources[name]);
+                }
+                return made;
+            }
+        });
+    });
+})(this, __xfa_objects)"#;
+
 fn zero(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::from(0.0))
 }
@@ -1133,6 +1229,7 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
         .function(NativeFunction::from_fn_ptr(layout_page0), js_string!("absPage"), 1)
         .function(NativeFunction::from_fn_ptr(layout_page_count), js_string!("pageCount"), 0)
         .function(NativeFunction::from_fn_ptr(layout_page_count), js_string!("absPageCount"), 0)
+        .function(NativeFunction::from_fn_ptr(layout_page_content), js_string!("pageContent"), 3)
         .function(NativeFunction::from_fn_ptr(relayout), js_string!("relayout"), 0)
         .function(NativeFunction::from_fn_ptr(relayout), js_string!("relayoutPageArea"), 0)
         .function(NativeFunction::from_fn_ptr(zero), js_string!("h"), 2)
@@ -1302,6 +1399,21 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
             }
             defined.push(name);
         }
+    }
+    // The form's script objects, under the names no object in scope has.
+    let mut any = false;
+    let sources = JsObject::with_null_proto();
+    for (name, source) in doc.script_objects.iter() {
+        if !is_identifier(name) || defined.contains(name) || crate::refuse(source).is_some() {
+            continue;
+        }
+        sources.set(JsString::from(name.as_str()), s(source), false, ctx)?;
+        defined.push(name.clone());
+        any = true;
+    }
+    if any {
+        ctx.register_global_property(js_string!("__xfa_objects"), sources, rw)?;
+        ctx.eval(Source::from_bytes(SCRIPT_OBJECTS))?;
     }
     Ok(())
 }

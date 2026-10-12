@@ -14,25 +14,38 @@ the automation tools) works on it unchanged. The engine does this when it opens 
 - **Packets** (`read_packets`): the XDP from one stream or the `(name, stream)` array; UTF-8
   and UTF-16; capped at 64 MB.
 - **Template** (`parse`): subforms, areas, fields, draws, exclusion groups, page sets with
-  page areas, content areas and media; measurements in mm, cm, in, pt and px; fonts, paragraphs,
+  page areas, content areas and media; measurements in mm, cm, in, pt and px; `anchorType`
+  (which point of its box an object's `x` and `y` give); fonts, paragraphs,
   margins, borders (edge order rules), captions with reserves, check-button items, pictures,
   rich text (`exData` XHTML: paragraphs, `br`, bold/italic/underline/size spans, embedded fields),
-  inline JPEG, PNG and GIF images, lines, rectangles, occurrences, `breakBefore`/`breakAfter`, overflow
+  comb fields (`<comb numberOfCells>`), required fields (`<validate nullTest="error">`), inline JPEG, PNG, GIF and BMP images (a BMP whose file
+  header gives no pixel offset, as Designer writes them, included), lines, rectangles, occurrences, `breakBefore`/`breakAfter`, overflow
   leaders, `columnWidths` and `colSpan`.
 - **Layout** (`layout`): positioned, `tb`, `lr-tb`/`rl-tb`, `table` and `row` layouts; a
-  container without a width is as wide as its content; flow across content areas and pages with
+  container without a width is as wide as its content; a field without one is `minW` wide and a
+  draw with `minW` as wide as its text; a caption reserve of zero is what the caption's text
+  needs, and a caption beside its field wraps in its reserve; flow across content areas and pages with
   page masters chosen by occurrence; a table's header row repeats after a break; presence
   `hidden` takes no space, `invisible` takes space; repeating subforms get their initial
   instances, in flowed content and in a top-to-bottom container inside positioned content (a
   table in an area) alike; fields that compute the page number or count on layout show the numbers.
 - **PDF** (`pdf::write_form`): pages with content streams in the standard 14 fonts (Arial and
-  friends → Helvetica, Courier New → Courier, serif faces → Times; nothing is embedded), JPEG
-  XObjects, and widgets: text (multi-line, max length, alignment), date (Acrobat's `AFDate`
+  friends → Helvetica, Courier New → Courier, serif faces → Times; nothing is embedded), image
+  XObjects, and widgets: text (multi-line, max length, comb, alignment), the Required flag on fields that must be
+  filled in (so Highlight fields outlines them in red), date (Acrobat's `AFDate`
   format and keystroke actions from the picture clause), check boxes and radio groups (from
   `exclGroup`), push buttons with Reset / Print / Save As / URI actions recognised from their
   scripts. Appearance streams are left empty for the forms layer to generate. Each field keeps
   its SOM path in `/PCSom`; the AcroForm gets `/PCXfaLayout` so a saved form is not laid out
   twice. The XFA packets stay, so Adobe's viewers keep rendering the form from them.
+
+- **Text** (`text`): measured with the standard fonts' own widths
+  (`pdfcraft_fonts::standard14`), so lines break, centre and are underlined where they are
+  drawn. Text is written in WinAnsiEncoding; the Latin letters it lacks but the standard fonts
+  have (ă, ș, ț, ő, ł, ğ, ě, … — Romanian, Central European, Baltic, Turkish) go through a second
+  font resource (`TiRoX` beside `TiRo`) whose `/Differences` name the glyphs, with a
+  `/ToUnicode` map so the text reads back. What no standard font has (CJK, Cyrillic, Greek) is
+  still shown as `?` and reported once.
 
 - **Data** (`data`): the `datasets` packet. On layout, a field takes its value from the data
   node at its data path: its SOM path without areas, which are named in SOM expressions but are
@@ -59,14 +72,17 @@ be measured exponentially often in their nesting. A measurement budget backs thi
   the datasets packet per event), and `rerender`, which lays the form out again from template,
   data and overrides. The scripts themselves run in the `js` crate's XFA object model; the
   engine runs initialize and calculate on open, change, exit, validate and calculate after a
-  field changes, and click for buttons.
+  field changes, and click for buttons; after each of these, once, the layout-ready scripts
+  (`<event activity="ready" ref="$layout">`: page counts, row numbers), which see the page
+  count the layout has then. The template's script objects (`<variables><script name>`,
+  `Template::script_objects`) are libraries every JavaScript event script can call by name.
 
   Private keys PdfCraft writes (other viewers ignore them):
 
   | Key | Where | Holds |
   | --- | --- | --- |
   | `/PCSom` | generated fields | the field's SOM path, so values go back to the data |
-  | `/PCXfaLayout` | AcroForm | what laying out produced, so a saved form is not laid out again |
+  | `/PCXfaLayout` | AcroForm | what laying out produced, so a saved form is not laid out again; its `/Version` is the layout that wrote it (`LAYOUT_VERSION`): a form an older layout wrote is laid out again from its template and data when opened (`layout_is_stale`), unless a generated field has been signed since |
   | `/PCXfaOverrides` | AcroForm | `<< /Presence << /som (hidden) … >> /Access << /som (readOnly) … >> >>`: presence and access scripts set, by SOM path (instance 0 of a repeating subform stands for all); applied to the template before every layout, so undo, save and reopen keep them. Adobe's viewers draw from the XFA packets and don't read it; at most 10 000 entries are read or written |
   | `/PCXfaClick` | generated push buttons | `true`: the template has a click script for this button. Such buttons carry no `/A`: XFA JavaScript is not Acrobat JavaScript, so it is never written as a `/S /JavaScript` action other viewers would run. PdfCraft finds the script by the field's `/PCSom` |
 
@@ -91,6 +107,13 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
   The object model covers what forms commonly use (`xfa.form`
   navigation and SOM resolution, `rawValue`, `presence`, `access`, instance managers,
   `xfa.host` messages, reset, print, focus and URLs, `xfa.layout` page numbers, `xfa.event`);
+  script objects by name (`checks.validate()`; each is evaluated in its own scope when a script
+  first names it, in every script afresh, so what one script stores in a script object's
+  variables is gone for the next; FormCalc script objects and paths through `variables` are
+  not reached), `xfa.layout.pageContent` (the first page answers for the whole form) and
+  `event.target.resetForm`; not attachments (`createDataObject`, `importDataObject` and
+  `exportDataObject` do nothing and say so in the console), which page an object is on
+  (`xfa.layout.page` answers 1),
   not `xfa.template`, data descriptions, `xfa.connectionSet`, `border`/`font`/`ui` properties
   (reads give a sink that accepts writes), `execEvent`, or the change event per keystroke.
   Validate failures show their message and keep the value, as Acrobat does for scripts.
@@ -133,7 +156,11 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
   file's data is held as a tree and written with the packet's own namespace prefix, never as
   the file's markup, and every rewrite of the packet is parsed back before it is written; the
   engine then lays a dynamic form out again from it and runs its calculations.
-- Missing: `keep` constraints, `subformSet` relations, `rl-tb` is mirrored `lr-tb`, font
-  metrics are the approximate Helvetica ones, and line heights are 1.15 × size.
+- Missing: `keep` constraints, `subformSet` relations, `rl-tb` is mirrored `lr-tb`; the fonts
+  are the standard 14 standing in for the template's typefaces (Myriad Pro is set in Helvetica,
+  which is wider), without kerning, and line heights are 1.15 × size; a push button's caption
+  wraps inside the button but is plain text in Helvetica (a coloured or styled span of a
+  rich-text caption is not kept); field values and button captions are drawn by the forms layer
+  in WinAnsiEncoding, so a typed ă or ț shows as `?` there.
 - Acrobat cannot be an oracle here (clean-room rules): layout follows the specification, and
   fidelity has been checked by eye on real government forms, not pixel-compared.

@@ -1,6 +1,6 @@
 //! Text measurement and line breaking with the standard 14 fonts that stand in for the
 //! template's typefaces (no font programs are embedded in dynamic XFA forms, and none are
-//! bundled here).
+//! bundled here), by those fonts' own widths.
 
 use crate::model::{Font, HAlign, Para, Rect, RichText, Run};
 
@@ -104,13 +104,23 @@ impl Face {
         self.family.resource_name(self.bold, self.italic)
     }
 
-    /// Advance of `s` at this face's size.
+    /// The PDF base font this face is set in.
+    pub fn base_font(&self) -> &'static str {
+        self.family.base_font(self.bold, self.italic)
+    }
+
+    /// Advance of `s` at this face's size, by the standard font's own widths. A character the
+    /// font can't draw is shown as `?` and measured as one.
     pub fn width(&self, s: &str) -> f64 {
-        match self.family {
-            Family::Courier => s.chars().count() as f64 * 0.6 * self.size,
-            Family::Helvetica => pdfcraft_fonts::helvetica_width(s, self.size) * if self.bold { 1.04 } else { 1.0 },
-            Family::Times => pdfcraft_fonts::helvetica_width(s, self.size) * if self.bold { 0.96 } else { 0.92 },
-        }
+        let base = self.base_font();
+        let units: u32 = s
+            .chars()
+            .map(|c| {
+                let c = if c == '\t' { ' ' } else { c };
+                u32::from(pdfcraft_fonts::standard14::advance(base, c).or_else(|| pdfcraft_fonts::standard14::advance(base, '?')).unwrap_or(600))
+            })
+            .fold(0, u32::saturating_add);
+        f64::from(units) * self.size / 1000.0
     }
 }
 
@@ -278,6 +288,20 @@ pub fn layout(rich: &RichText, rect: Rect, para: &Para, base: &Face, embed: &dyn
         y += lh;
     }
     Block { spans, height: total }
+}
+
+/// The width of the longest paragraph of `rich` set on one line, with the paragraph margins.
+pub fn natural_width(rich: &RichText, para: &Para, base: &Face, embed: &dyn Fn(&str) -> String) -> f64 {
+    let widest = rich
+        .paragraphs
+        .iter()
+        .map(|p| {
+            let ws = words(&p.runs, base, embed);
+            let trailing = ws.last().map_or(0.0, |w| if w.text.ends_with(' ') { w.face.width(" ") } else { 0.0 });
+            (ws.iter().map(|w| w.width).sum::<f64>() - trailing).max(0.0)
+        })
+        .fold(0.0, f64::max);
+    widest + para.margin_left + para.margin_right + para.text_indent.max(0.0)
 }
 
 /// Height `rich` needs at `width` (for boxes without an explicit height).

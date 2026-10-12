@@ -104,6 +104,59 @@ impl StandardFont {
         }
     }
 
+    /// PdfCraft patch: the standard font with this PostScript name (`Times-BoldItalic`).
+    pub fn from_postscript_name(name: &str) -> Option<Self> {
+        [
+            Self::Helvetica,
+            Self::HelveticaBold,
+            Self::HelveticaOblique,
+            Self::HelveticaBoldOblique,
+            Self::Courier,
+            Self::CourierBold,
+            Self::CourierOblique,
+            Self::CourierBoldOblique,
+            Self::TimesRoman,
+            Self::TimesBold,
+            Self::TimesItalic,
+            Self::TimesBoldItalic,
+            Self::ZapfDingBats,
+            Self::Symbol,
+        ]
+        .into_iter()
+        .find(|f| f.postscript_name() == name)
+    }
+
+    /// PdfCraft patch: the name of the glyph a Latin text font (not Symbol or Zapf Dingbats) has
+    /// for `c`, and its advance in thousandths of the font size, from the standard metrics.
+    /// Writers lay text out by these and name the glyphs in `/Differences`. Ț and ț, which the
+    /// glyph list has no name for, are the fonts' `Tcommaaccent` and `tcommaaccent`.
+    pub fn glyph_for_char(&self, c: char) -> Option<(&'static str, f32)> {
+        if matches!(self, Self::ZapfDingBats | Self::Symbol) {
+            return None;
+        }
+        // The name the fonts themselves use for the character: the glyph list has several
+        // names for some (`odblacute`, `ohungarumlaut`), the metrics one.
+        static NAMES: std::sync::OnceLock<HashMap<char, &'static str>> = std::sync::OnceLock::new();
+        let names = NAMES.get_or_init(|| {
+            let mut names = HashMap::new();
+            // The text faces share one glyph set; names in order, so the choice is the same
+            // every time where two of them mean one character.
+            let mut all: Vec<&'static str> = metrics::HELVETICA.keys().copied().collect();
+            all.sort_unstable();
+            for name in all {
+                if let Some(c) = glyph_names::get(name).and_then(|u| u.chars().next()) {
+                    names.entry(c).or_insert(name);
+                }
+            }
+            for (c, name) in [('\u{021A}', "Tcommaaccent"), ('\u{021B}', "tcommaaccent")] {
+                names.entry(c).or_insert(name);
+            }
+            names
+        });
+        let name = *names.get(&c)?;
+        self.get_width(name).map(|w| (name, w))
+    }
+
     /// Return the postscrit name of the font.
     pub fn postscript_name(&self) -> &'static str {
         match self {

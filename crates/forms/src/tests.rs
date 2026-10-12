@@ -1865,3 +1865,81 @@ fn invalid_appearance_patches_are_refused_before_anything_is_written() {
     assert!(set_props(&mut doc, "name", &props).is_err());
     assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), before);
 }
+
+/// A comb field with a border has a divider between its cells, as other viewers
+/// draw it; one without a border, or with an underline, has none.
+#[test]
+fn a_bordered_comb_field_has_dividers_between_its_cells() {
+    let mut doc = one_page();
+    let name = add_field(&mut doc, 0, [50.0, 700.0, 250.0, 720.0], &NewField::Text { multiline: false }, None).unwrap();
+    set_props(&mut doc, &name, &FieldProps { flags: vec![(flags::COMB, true)], max_len: Some(Some(4)), ..FieldProps::default() }).unwrap();
+    let dividers = |doc: &Document| -> Vec<String> {
+        let f = fields(doc).into_iter().find(|f| f.name == name).unwrap();
+        let (ap, _) = crate::appearance::field_appearance_drawn(doc, &f, &f.widgets[0], &["2020".to_string()], false);
+        let content = String::from_utf8_lossy(&ap.decoded().unwrap()).into_owned();
+        content.lines().filter(|l| l.ends_with(" l S") && l.contains(" m ")).map(str::to_string).collect()
+    };
+    let widget = fields(&doc).into_iter().find(|f| f.name == name).unwrap().widgets[0].obj;
+    let style = |doc: &mut Document, border: Option<[f64; 3]>, width: f64, kind: &str| {
+        doc.update_dict(widget, |d| {
+            let mut mk = pdfcraft_cos::Dict::new();
+            if let Some(c) = border {
+                mk.set(b"BC".to_vec(), Object::Array(c.iter().map(|v| Object::Real(*v)).collect()));
+            }
+            d.set(b"MK".to_vec(), Object::Dict(mk));
+            let mut bs = pdfcraft_cos::Dict::new();
+            bs.set(b"W".to_vec(), Object::Real(width));
+            bs.set(b"S".to_vec(), Object::name(kind));
+            d.set(b"BS".to_vec(), Object::Dict(bs));
+        })
+        .unwrap();
+    };
+    // Four cells of 50 points: dividers at 50, 100 and 150, inside the border.
+    style(&mut doc, Some([0.0, 0.0, 0.0]), 1.0, "S");
+    assert_eq!(dividers(&doc), ["50 1 m 50 19 l S", "100 1 m 100 19 l S", "150 1 m 150 19 l S"]);
+    // No border colour, no border width, an underline: no dividers.
+    style(&mut doc, None, 1.0, "S");
+    assert!(dividers(&doc).is_empty());
+    style(&mut doc, Some([0.0, 0.0, 0.0]), 0.0, "S");
+    assert!(dividers(&doc).is_empty());
+    style(&mut doc, Some([0.0, 0.0, 0.0]), 1.0, "U");
+    assert_eq!(dividers(&doc).len(), 1, "the underline itself");
+    // A hostile cell count draws a bounded number of lines, and none once cells are too narrow.
+    style(&mut doc, Some([0.0, 0.0, 0.0]), 1.0, "S");
+    set_props(&mut doc, &name, &FieldProps { max_len: Some(Some(100_000)), ..FieldProps::default() }).unwrap();
+    assert!(dividers(&doc).is_empty());
+}
+
+/// A caption wider than its button wraps onto centred lines inside the button
+/// instead of running out of both sides; a caption that fits stays on one line.
+#[test]
+fn a_button_caption_wider_than_the_button_wraps_inside_it() {
+    let mut doc = one_page();
+    let long = "Import fisier 390.txt cu popularea formularului";
+    let lines_of = |doc: &mut Document, rect: [f64; 4], caption: &str| -> (Vec<String>, String) {
+        let name = add_field(doc, 0, rect, &NewField::Button { caption: caption.into() }, None).unwrap();
+        let f = fields(doc).into_iter().find(|f| f.name == name).unwrap();
+        let ap = doc.get(f.widgets[0].obj).as_dict().and_then(|d| d.get(b"AP").map(|a| doc.resolve(a))).unwrap();
+        let n = doc.resolve(ap.as_dict().unwrap().get(b"N").unwrap());
+        let Object::Stream(s) = &*n else { panic!("no appearance") };
+        let content = String::from_utf8_lossy(&s.decoded().unwrap()).into_owned();
+        let shown = content
+            .lines()
+            .filter(|l| l.ends_with(" Tj") || l.ends_with(" Tj ET"))
+            .map(|l| l[l.find('(').unwrap() + 1..l.rfind(')').unwrap()].to_string())
+            .collect();
+        (shown, content)
+    };
+    // 170 by 40 points: two lines, every word kept, clipped to the button.
+    let (shown, content) = lines_of(&mut doc, [50.0, 600.0, 220.0, 640.0], long);
+    assert!(shown.len() >= 2, "{shown:?}");
+    assert_eq!(shown.join(" ").split_whitespace().collect::<Vec<_>>(), long.split_whitespace().collect::<Vec<_>>());
+    assert!(content.contains(" re W n"), "clipped: {content}");
+    // A short caption is one line, as before.
+    let (shown, content) = lines_of(&mut doc, [50.0, 500.0, 220.0, 540.0], "VALIDARE");
+    assert_eq!(shown, ["VALIDARE"]);
+    assert!(!content.contains(" re W n"));
+    // A button too small for its caption at any size still draws a bounded number of lines.
+    let (shown, _) = lines_of(&mut doc, [50.0, 400.0, 60.0, 406.0], &long.repeat(40));
+    assert!(shown.len() <= 50);
+}

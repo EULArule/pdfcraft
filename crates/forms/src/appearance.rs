@@ -216,6 +216,9 @@ fn stroke_op(fill: &str) -> String {
     }
 }
 
+/// Most dividers drawn in a comb field (`/MaxLen` is the file's to choose).
+const MAX_COMB_DIVIDERS: usize = 500;
+
 /// Background and border from `/MK` and `/BS`; returns (content, border width).
 fn frame(doc: &Document, wd: &Dict, w: f64, h: f64) -> (String, f64) {
     let mk = wd.get(b"MK").map(|m| doc.resolve(m)).and_then(|m| m.as_dict().cloned());
@@ -416,6 +419,25 @@ pub fn field_appearance_drawn(doc: &Document, f: &Field, w: &Widget, values: &[S
                 if comb {
                     let cells = f.max_len.unwrap_or(1).max(1);
                     let cell = width / cells as f64;
+                    // A bordered comb has a divider between its cells, in the border's colour
+                    // (not under an underline border, and not where cells are too narrow to tell
+                    // apart).
+                    let mk = wd.get(b"MK").map(|m| doc.resolve(m)).and_then(|m| m.as_dict().cloned());
+                    let underline = wd
+                        .get(b"BS")
+                        .map(|b| doc.resolve(b))
+                        .and_then(|b| b.as_dict().and_then(|b| b.name(b"S").map(|s| s == b"U")))
+                        .unwrap_or(false);
+                    if let Some(bc) = color_array(doc, mk.as_ref(), b"BC")
+                        && bw > 0.0
+                        && !underline
+                        && cell >= 2.0 * bw + 1.0
+                    {
+                        c.push_str(&format!("{}\n{} w\n", stroke_op(&bc), n(bw)));
+                        for i in 1..cells.min(MAX_COMB_DIVIDERS + 1) {
+                            c.push_str(&format!("{} {} m {} {} l S\n", n(cell * i as f64), n(bw), n(cell * i as f64), n(height - bw)));
+                        }
+                    }
                     for (i, ch) in text.chars().take(cells).enumerate() {
                         let s = ch.to_string();
                         show(&mut body, cell * i as f64 + (cell - width_of(&s, size)) / 2.0, y, &s);

@@ -31,6 +31,52 @@ impl Presence {
     }
 }
 
+/// Which point of an object's box its `x` and `y` give (`anchorType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Anchor {
+    #[default]
+    TopLeft,
+    TopCenter,
+    TopRight,
+    MiddleLeft,
+    MiddleCenter,
+    MiddleRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl Anchor {
+    pub fn parse(s: Option<&str>) -> Anchor {
+        match s.map(str::trim) {
+            Some("topCenter") => Anchor::TopCenter,
+            Some("topRight") => Anchor::TopRight,
+            Some("middleLeft") => Anchor::MiddleLeft,
+            Some("middleCenter") => Anchor::MiddleCenter,
+            Some("middleRight") => Anchor::MiddleRight,
+            Some("bottomLeft") => Anchor::BottomLeft,
+            Some("bottomCenter") => Anchor::BottomCenter,
+            Some("bottomRight") => Anchor::BottomRight,
+            _ => Anchor::TopLeft,
+        }
+    }
+
+    /// How far left of and above the anchor point the top left corner of a `w` by `h` box is.
+    pub fn offset(self, w: f64, h: f64) -> (f64, f64) {
+        let dx = match self {
+            Anchor::TopLeft | Anchor::MiddleLeft | Anchor::BottomLeft => 0.0,
+            Anchor::TopCenter | Anchor::MiddleCenter | Anchor::BottomCenter => w / 2.0,
+            Anchor::TopRight | Anchor::MiddleRight | Anchor::BottomRight => w,
+        };
+        let dy = match self {
+            Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => 0.0,
+            Anchor::MiddleLeft | Anchor::MiddleCenter | Anchor::MiddleRight => h / 2.0,
+            Anchor::BottomLeft | Anchor::BottomCenter | Anchor::BottomRight => h,
+        };
+        (dx, dy)
+    }
+}
+
 /// How a subform places its children.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -276,6 +322,8 @@ pub struct Common {
     pub id: Option<String>,
     pub x: Option<f64>,
     pub y: Option<f64>,
+    /// The point of the box `x` and `y` give, in positioned content.
+    pub anchor: Anchor,
     pub w: Option<f64>,
     pub h: Option<f64>,
     pub min_w: Option<f64>,
@@ -427,6 +475,10 @@ pub struct Field {
     /// Choice lists: how the list opens.
     pub choice: ChoiceList,
     pub max_chars: Option<usize>,
+    /// A comb of this many cells, one character in each (`<comb numberOfCells>`).
+    pub comb: Option<usize>,
+    /// The field must be filled in (`<validate nullTest="error">`).
+    pub required: bool,
     pub tooltip: Option<String>,
     pub access: Access,
     /// The edit picture clause (`<ui>…<picture>`), e.g. `date{YYYY-MM-DD}`.
@@ -623,9 +675,20 @@ pub struct PageArea {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Template {
     pub root: Subform,
+    /// The form's script objects (`<variables><script name="…">`): libraries of functions its
+    /// event scripts call by that name (`validate.check()`). In document order.
+    pub script_objects: Vec<ScriptObject>,
     /// Fields that compute the page number or the page count on layout, by `id`, so text that
     /// embeds them can show the numbers.
     pub page_roles: Vec<(String, PageRole)>,
+}
+
+/// A named script of a `<variables>` element.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptObject {
+    pub name: String,
+    pub text: String,
+    pub formcalc: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

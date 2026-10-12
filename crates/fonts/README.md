@@ -7,6 +7,14 @@ Today it holds what generated appearances need without a font program:
 - `helvetica_width`: an approximation of Helvetica's proportions by character class. No metrics
   file or font program from any vendor is bundled; widths are PdfCraft's own estimates, good
   enough for line breaking and alignment, not for typesetting.
+- `standard14`: which Latin characters the standard 14 text fonts have, each one's glyph name
+  and its advance in Helvetica, Times, Courier and their bold and italic faces (`glyph`,
+  `advance`), read from the standard-14 metrics the vendored `hayro-interpret` carries (the one
+  place AGENTS.md §1.1 allows them; nothing is copied here). These fonts have more letters than
+  WinAnsiEncoding reaches; `extended_code`, `extended_encoding` and `extended_to_unicode` give
+  those (ă, ș, ț, ő, ł, …) codes in a second encoding, so text set in a standard font shows them
+  without an embedded font program. Used by the XFA layout; `helvetica_width` and the
+  appearances built on it still use the estimates above.
 - `wrap`: greedy line breaking with that measure (paragraphs on newlines, long words split).
 - `win_ansi`: Unicode → WinAnsiEncoding bytes (`?` for characters it can't represent), and
   `literal` to write bytes as a PDF literal string. Nothing writes that `?` silently. Callers

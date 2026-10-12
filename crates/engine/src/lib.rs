@@ -2164,7 +2164,7 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -> 
                 && pdfcraft_forms::fields(doc).iter().any(|f| f.name == *name && f.button == Some(pdfcraft_forms::af::ButtonAction::ImportIcon));
             if image_field {
                 let Some(content_type) = image_content_type(image) else {
-                    return Err(EditError::Invalid(format!("{name}: an XFA form keeps a PNG, JPEG or GIF picture; choose one of those")));
+                    return Err(EditError::Invalid(format!("{name}: an XFA form keeps a PNG, JPEG, GIF or BMP picture; choose one of those")));
                 };
                 pdfcraft_forms::set_button_icon(doc, name, img, px)?;
                 let som = pdfcraft_xfa::fields_by_som(doc).into_iter().find(|(_, n)| n == name).map(|(s, _)| s).unwrap_or_else(|| name.clone());
@@ -2618,6 +2618,16 @@ fn xfa_layout(doc: &mut pdfcraft_cos::Document) -> Result<XfaLayout, String> {
     Ok(report)
 }
 
+/// Lay a form an older PdfCraft laid out and saved out again, from its template, its data (which
+/// holds every value filled in) and what its scripts had shown, hidden and locked.
+fn xfa_relayout_stale(doc: &mut pdfcraft_cos::Document) -> Result<XfaLayout, String> {
+    let tpl = pdfcraft_xfa::template_of(doc).map_err(|e| e.to_string())?;
+    let mut report = pdfcraft_xfa::rerender(doc, &tpl).map_err(|e| e.to_string())?;
+    xfa_redraw(doc)?;
+    report.warnings.extend(undrawn_field_warnings(doc));
+    Ok(report)
+}
+
 /// Give the fields of a laid-out XFA form their appearances. A signed signature box keeps the
 /// picture its signer's application drew.
 pub(crate) fn xfa_redraw(doc: &mut pdfcraft_cos::Document) -> Result<(), String> {
@@ -2757,6 +2767,7 @@ fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
         pdfcraft_xfa::image::Kind::Jpeg => Some("image/jpeg"),
         pdfcraft_xfa::image::Kind::Png => Some("image/png"),
         pdfcraft_xfa::image::Kind::Gif => Some("image/gif"),
+        pdfcraft_xfa::image::Kind::Bmp => Some("image/bmp"),
     }
 }
 
@@ -2946,6 +2957,21 @@ impl Session {
                         let mut info = info;
                         info.warnings.push(format!("This dynamic XFA form could not be laid out: {e}"));
                         (bytes, info, Ok(Ok(cos)), None)
+                    }
+                }
+            }
+            // Laid out by an older PdfCraft: laid out again from its template and data, so it
+            // gets what the layout has learnt since. When that fails the saved layout stays.
+            (Some(pdfcraft_render::Xfa::Dynamic), Ok(Ok(cos))) if pdfcraft_xfa::layout_is_stale(&cos) => {
+                let mut work = cos.clone();
+                let again = guard(|| xfa_relayout_stale(&mut work))
+                    .unwrap_or_else(|m| Err(format!("laying it out again failed unexpectedly ({m})")))
+                    .and_then(|report| rebase(&work).map(|(b, i, c)| (b, i, c, report)));
+                match again {
+                    Ok((b, i, c, report)) => (b, i, Ok(Ok(c)), Some(report)),
+                    Err(_) => {
+                        let report = pdfcraft_xfa::existing_layout(&cos);
+                        (bytes, info, Ok(Ok(cos)), report)
                     }
                 }
             }

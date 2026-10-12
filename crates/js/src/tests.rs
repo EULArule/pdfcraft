@@ -371,7 +371,7 @@ mod xfa_model {
 
     fn go(script: &str, target: &str, activity: &str) -> XfaOutcome {
         let ev = XfaEvent { activity: activity.into(), target: target.into(), ..Default::default() };
-        let doc = XfaDoc { file_name: "f.pdf".into(), page: 1, page_count: 3 };
+        let doc = XfaDoc { file_name: "f.pdf".into(), page: 1, page_count: 3, ..Default::default() };
         run_xfa(script, &ev, &doc, &form(), Limits::default())
     }
 
@@ -382,6 +382,44 @@ mod xfa_model {
         assert_eq!(o.result.as_deref(), Some("10"));
         let o = go("this.rawValue = xfa.form.form1.page1.qty.rawValue + 1;", "form1[0].page1[0].total[0]", "calculate");
         assert_eq!(o.effects, vec![XfaEffect::SetValue { som: "form1[0].page1[0].total[0]".into(), value: "5".into() }]);
+    }
+
+    /// A form's script objects are libraries its event scripts call by name.
+    #[test]
+    fn script_objects_are_reached_by_name_and_evaluated_when_first_used() {
+        let run = |script: &str| {
+            let ev = XfaEvent { activity: "click".into(), target: "form1[0].page1[0].go[0]".into(), ..Default::default() };
+            let objects = vec![
+                (
+                    "checks".to_string(),
+                    "var limit = 3; function over(n) { return n > limit; } function twice(n) { return helpers.double(n); }".to_string(),
+                ),
+                ("helpers".to_string(), "function double(n) { return n * 2; }".to_string()),
+                ("broken".to_string(), "function ( {".to_string()),
+                // A name an object in scope has stays that object's.
+                ("qty".to_string(), "function f() { return 1; }".to_string()),
+            ];
+            let doc = XfaDoc { page_count: 3, script_objects: std::sync::Arc::new(objects), ..Default::default() };
+            run_xfa(script, &ev, &doc, &form(), Limits::default())
+        };
+        let o = run("checks.over(qty.rawValue) + ':' + checks.twice(21) + ':' + checks.limit + ':' + typeof checks.missing");
+        assert_eq!((o.error, o.result.as_deref()), (None, Some("true:42:3:undefined")));
+        // A script that names no script object never evaluates one, so a broken one harms
+        // only the scripts that use it.
+        assert_eq!(run("qty.rawValue").result.as_deref(), Some("4"));
+        assert!(run("broken.f()").error.is_some());
+        assert_eq!(run("typeof qty.f").result.as_deref(), Some("undefined"));
+        // What the object's functions do to the form are the script's effects.
+        let o = run("checks.x = 1; (function () { helpers.double(1); total.rawValue = checks.twice(4); })(); checks.x");
+        assert_eq!(o.result.as_deref(), Some("1"));
+        assert_eq!(o.effects, vec![XfaEffect::SetValue { som: "form1[0].page1[0].total[0]".into(), value: "8".into() }]);
+        // A runaway loop inside a script object ends like any other.
+        let ev = XfaEvent { activity: "click".into(), target: "form1[0].page1[0].go[0]".into(), ..Default::default() };
+        let doc = XfaDoc {
+            script_objects: std::sync::Arc::new(vec![("spin".to_string(), "function forever() { while (true) {} }".to_string())]),
+            ..Default::default()
+        };
+        assert!(run_xfa("spin.forever()", &ev, &doc, &form(), Limits::default()).error.is_some());
     }
 
     #[test]
@@ -585,7 +623,7 @@ mod formcalc {
 
     fn go(script: &str, target: &str, activity: &str) -> XfaOutcome {
         let ev = XfaEvent { activity: activity.into(), target: target.into(), ..Default::default() };
-        let doc = XfaDoc { file_name: "f.pdf".into(), page: 1, page_count: 3 };
+        let doc = XfaDoc { file_name: "f.pdf".into(), page: 1, page_count: 3, ..Default::default() };
         run_formcalc(script, &ev, &doc, &form(), Limits::default())
     }
 

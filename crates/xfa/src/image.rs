@@ -1,4 +1,4 @@
-//! Pictures in templates and data: JPEG (embedded as is), PNG and GIF (decoded to 8-bit
+//! Pictures in templates and data: JPEG (embedded as is), PNG, GIF and BMP (decoded to 8-bit
 //! samples with a soft mask for transparency). Sizes are read from the headers without
 //! decoding, so layout stays cheap; decoding happens once, when the PDF is written.
 
@@ -13,6 +13,7 @@ pub enum Kind {
     Jpeg,
     Png,
     Gif,
+    Bmp,
 }
 
 /// What the bytes are, by their signature (the declared content type is often wrong).
@@ -23,6 +24,11 @@ pub fn kind(data: &[u8]) -> Option<Kind> {
         Some(Kind::Png)
     } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
         Some(Kind::Gif)
+    } else if data.starts_with(b"BM")
+        && data.get(14..18).is_some_and(|n| matches!(u32::from_le_bytes([n[0], n[1], n[2], n[3]]), 12 | 40 | 52 | 56 | 64 | 108 | 124))
+    {
+        // "BM" alone is two letters of text: the size of the header that follows is one of BMP's.
+        Some(Kind::Bmp)
     } else {
         None
     }
@@ -56,7 +62,55 @@ fn header_size(data: &[u8]) -> Option<(u32, u32)> {
             let (w, h) = (le(6)?, le(8)?);
             (w > 0 && h > 0).then_some((w, h))
         }
+        Kind::Bmp => {
+            // The oldest header holds 16-bit sizes; the others 32-bit signed ones, the height
+            // negative when the rows run top to bottom.
+            if data.get(14..18)? == 12u32.to_le_bytes() {
+                let le = |at: usize| data.get(at..at + 2).map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])));
+                let (w, h) = (le(18)?, le(20)?);
+                return (w > 0 && h > 0).then_some((w, h));
+            }
+            let le = |at: usize| data.get(at..at + 4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            let (w, h) = (le(18)?, le(22)?);
+            (w > 0 && h != 0).then_some((w.unsigned_abs(), h.unsigned_abs()))
+        }
     }
+}
+
+/// A BMP whose file header gives no pixel offset (zero, as some form designers write it), with
+/// the offset filled in: the pixels follow the info header, the colour masks and the palette.
+/// `None` when the offset is there or the headers can't be read.
+fn bmp_with_pixel_offset(data: &[u8]) -> Option<Vec<u8>> {
+    let le32 = |at: usize| data.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let le16 = |at: usize| data.get(at..at + 2).map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])));
+    if le32(10)? != 0 {
+        return None;
+    }
+    let header = le32(14)?;
+    let (bits, used, compression, entry) = if header == 12 { (le16(24)?, 0, 0, 3) } else { (le16(28)?, le32(46)?, le32(30)?, 4) };
+    let colours = match bits {
+        1 | 4 | 8 => {
+            if used == 0 {
+                1u32 << bits
+            } else {
+                used.min(256)
+            }
+        }
+        _ => 0,
+    };
+    // A 40-byte header with BI_BITFIELDS (3) or BI_ALPHABITFIELDS (6) is followed by its masks.
+    let masks = match (header, compression) {
+        (40, 3) => 12,
+        (40, 6) => 16,
+        _ => 0,
+    };
+    let offset = 14u32.checked_add(header)?.checked_add(masks)?.checked_add(colours.checked_mul(entry)?)?;
+    if offset as usize >= data.len() {
+        return None;
+    }
+    let mut out = data.to_vec();
+    out.get_mut(10..14)?.copy_from_slice(&offset.to_le_bytes());
+    Some(out)
 }
 
 /// Samples ready for an image XObject.
@@ -76,7 +130,7 @@ fn too_big() -> String {
     format!("an image has more than {} million pixels and is left out", MAX_PIXELS / 1_000_000)
 }
 
-/// Decode a PNG or GIF (its first frame). JPEGs are embedded as they are and are not decoded
+/// Decode a PNG, a GIF (its first frame) or a BMP. JPEGs are embedded as they are and are not decoded
 /// here. The error is the warning to show.
 pub fn decode(data: &[u8]) -> Result<Decoded, String> {
     let bad = |m: String| format!("an image could not be decoded and is left out: {m}");
@@ -117,11 +171,13 @@ pub fn decode(data: &[u8]) -> Result<Decoded, String> {
             let alpha = (has_alpha && alpha.iter().any(|a| *a != 255)).then_some(alpha);
             Ok(Decoded { width: frame.width, height: frame.height, color_space, samples: colour, alpha })
         }
-        Some(Kind::Gif) => {
+        Some(format @ (Kind::Gif | Kind::Bmp)) => {
+            let fixed = if format == Kind::Bmp { bmp_with_pixel_offset(data) } else { None };
+            let data = fixed.as_deref().unwrap_or(data);
             // The frame may be larger than the logical screen the header gives: the decoder is
             // told the limits, so it refuses before allocating.
             let mut reader = image::ImageReader::new(std::io::Cursor::new(data));
-            reader.set_format(image::ImageFormat::Gif);
+            reader.set_format(if format == Kind::Bmp { image::ImageFormat::Bmp } else { image::ImageFormat::Gif });
             let mut limits = image::Limits::default();
             limits.max_image_width = Some(MAX_SIDE);
             limits.max_image_height = Some(MAX_SIDE);
@@ -139,6 +195,6 @@ pub fn decode(data: &[u8]) -> Result<Decoded, String> {
             let alpha = px.iter().any(|p| p[3] != 255).then(|| px.iter().map(|p| p[3]).collect());
             Ok(Decoded { width, height, color_space: if gray { "DeviceGray" } else { "DeviceRGB" }, samples, alpha })
         }
-        Some(Kind::Jpeg) | None => Err(bad("not a PNG or GIF".into())),
+        Some(Kind::Jpeg) | None => Err(bad("not a PNG, GIF or BMP".into())),
     }
 }

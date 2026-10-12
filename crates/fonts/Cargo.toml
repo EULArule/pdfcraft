@@ -10,6 +10,9 @@ workspace = true
 
 [dependencies]
 pdfcraft-cos = { workspace = true }
+# The standard-14 glyph names and widths (`standard14`): the vendored copy carries the tables
+# (AGENTS.md §1.1), so they are read from it instead of being kept twice. Already in the tree.
+hayro-interpret = "0.7.0"
 # Glyph outlines of the bundled script font (typed signatures); already in the tree via egui.
 skrifa = "0.44"
 # Arabic shaping for text written into PDFs; already in the tree via egui, on the same read-fonts.

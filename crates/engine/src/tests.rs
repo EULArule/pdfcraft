@@ -4196,3 +4196,97 @@ fn copy_image_finds_a_picture_inside_form_artwork_under_text() {
     assert_eq!(d.page_image_copy_file(0, 0).unwrap(), ("jpg", jpeg));
     assert!(d.page_image_copy_file(0, 1).is_err());
 }
+
+/// A form with a count its layout-ready script computes, a button whose click calls a script
+/// object, and a required field.
+fn scripted_layout_xdp() -> &'static str {
+    r##"<?xml version="1.0" encoding="UTF-8"?>
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/"><template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form1" layout="tb">
+<pageSet><pageArea name="p"><contentArea x="36pt" y="36pt" w="500pt" h="700pt"/><medium short="612pt" long="792pt"/></pageArea></pageSet>
+<subform name="body" layout="tb">
+<variables><script contentType="application/x-javascript" name="checks">
+function names() { return form1.body.owner.rawValue == null ? 0 : 1; }
+function validate() { if (names() == 0) { app.alert("Name the owner first"); return; } form1.body.verdict.rawValue = "valid " + xfa.layout.pageCount(); }
+</script></variables>
+<field name="owner" w="300pt" h="20pt"><ui><textEdit/></ui><validate nullTest="error"/></field>
+<field name="annexes" w="300pt" h="20pt" access="readOnly"><ui><numericEdit/></ui>
+<event activity="ready" ref="$layout"><script contentType="application/x-javascript">this.rawValue = xfa.layout.pageCount() - 1;</script></event></field>
+<field name="verdict" w="300pt" h="20pt" access="readOnly"><ui><textEdit/></ui></field>
+<field name="go" w="100pt" h="20pt"><ui><button/></ui><caption><value><text>Validate</text></value></caption>
+<event activity="click"><script contentType="application/x-javascript">checks.validate();</script></event></field>
+</subform>
+<subform name="annex" layout="tb"><breakBefore targetType="pageArea"/><draw w="200pt" h="20pt"><value><text>Annex</text></value></draw></subform>
+</subform></template></xdp:xdp>"##
+}
+
+#[test]
+fn xfa_layout_ready_scripts_and_script_objects_run() {
+    let bytes = Arc::new(pdfcraft_xfa::fixtures::shell(scripted_layout_xdp()));
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("form.pdf", None, bytes, None).expect("opens");
+    let value = |s: &Session, n: &str| {
+        s.get(id).unwrap().form.iter().find(|f| f.name == n).map(|f| f.value.clone()).unwrap_or_else(|| panic!("no field {n}"))
+    };
+    // Two pages: the layout-ready script sees the count once the form is laid out.
+    assert_eq!(s.get(id).unwrap().info.pages.len(), 2);
+    assert_eq!(value(&s, "annexes"), vec!["1".to_string()], "{:?}", s.take_js_output(id));
+    assert!(!s.get(id).unwrap().dirty, "what opening computes is nothing to save");
+    // The field that must be filled in is required.
+    let owner = s.get(id).unwrap().form.iter().find(|f| f.name == "owner").unwrap().clone();
+    assert!(owner.has(field_flags::REQUIRED));
+    // The button's script calls the form's script object: first its alert, then its verdict.
+    let o = s.run_javascript(id, "", Some("go")).unwrap();
+    assert_eq!((o.error.clone(), o.alerts.clone()), (None, vec!["Name the owner first".to_string()]), "{o:?}");
+    s.apply(id, Edit::SetFieldValue { name: "owner".into(), value: FieldValue::Text("Ada".into()) }).unwrap();
+    let o = s.run_javascript(id, "", Some("go")).unwrap();
+    assert_eq!(o.error, None, "{o:?}");
+    assert_eq!(value(&s, "verdict"), vec!["valid 2".to_string()]);
+    assert_eq!(value(&s, "annexes"), vec!["1".to_string()]);
+}
+
+/// A form an older PdfCraft laid out and saved is laid out again when opened, so it gets what
+/// the layout has learnt since (here: required fields); its values come back from its data.
+#[test]
+fn a_form_laid_out_by_an_older_layout_is_laid_out_again_on_open() {
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("form.pdf", None, Arc::new(pdfcraft_xfa::fixtures::shell(scripted_layout_xdp())), None).expect("opens");
+    s.apply(id, Edit::SetFieldValue { name: "owner".into(), value: FieldValue::Text("Ada".into()) }).unwrap();
+    let saved = s.get(id).unwrap().bytes.clone();
+    // As an older layout left it: no version in the mark, no Required flag on the field.
+    let mut old = pdfcraft_cos::Document::open(saved).unwrap();
+    assert!(!pdfcraft_xfa::layout_is_stale(&old));
+    let root = old.root().unwrap();
+    let acro_ref = old.get(root).as_dict().unwrap().get(b"AcroForm").and_then(pdfcraft_cos::Object::as_ref);
+    let unversion = |a: &mut pdfcraft_cos::Dict| {
+        if let Some(pdfcraft_cos::Object::Dict(mut mark)) = a.get(pdfcraft_xfa::LAYOUT_KEY).cloned() {
+            mark.remove(b"Version");
+            a.set(pdfcraft_xfa::LAYOUT_KEY.to_vec(), pdfcraft_cos::Object::Dict(mark));
+        }
+    };
+    match acro_ref {
+        Some(r) => old.update_dict(r, unversion).unwrap(),
+        None => old
+            .update_dict(root, |c| {
+                if let Some(pdfcraft_cos::Object::Dict(mut a)) = c.get(b"AcroForm").cloned() {
+                    unversion(&mut a);
+                    c.set(b"AcroForm".to_vec(), pdfcraft_cos::Object::Dict(a));
+                }
+            })
+            .unwrap(),
+    }
+    let owner = pdfcraft_forms::fields(&old).into_iter().find(|f| f.name == "owner").unwrap();
+    old.update_dict(owner.obj, |d| {
+        d.remove(b"Ff");
+    })
+    .unwrap();
+    assert!(pdfcraft_xfa::layout_is_stale(&old));
+    let bytes = Arc::new(pdfcraft_cos::write_incremental(&old, &pdfcraft_cos::SaveOptions::default()).unwrap());
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("old.pdf", None, bytes, None).expect("opens");
+    let doc = s.get(id).unwrap();
+    let owner = doc.form.iter().find(|f| f.name == "owner").unwrap();
+    assert!(owner.has(field_flags::REQUIRED), "laid out again");
+    assert_eq!(owner.value, vec!["Ada".to_string()], "the value comes back from the data");
+    assert_eq!(doc.form.iter().filter(|f| f.name.starts_with("owner")).count(), 1, "the old fields are replaced, not kept beside the new");
+    assert!(!pdfcraft_xfa::layout_is_stale(&pdfcraft_cos::Document::open(doc.bytes.clone()).unwrap()));
+}

@@ -750,6 +750,9 @@ fn form_stream(place: crate::appearance::Placement, content: Vec<u8>, resources:
     Stream::flate(d, &content)
 }
 
+/// Most lines of a wrapped button caption drawn.
+const MAX_CAPTION_LINES: usize = 50;
+
 /// A push button: background, border, its icon (`/MK /I`, scaled to fit and centred) and its
 /// centred caption (unless the layout is icon only, `/TP 1`). The caption is drawn in Helvetica,
 /// with the first character it can't draw (drawn as `?`), for the caller to mark and report.
@@ -780,11 +783,37 @@ fn button_appearance(doc: &Document, w: &Widget) -> (Stream, Option<char>) {
     let mut missing = None;
     if !icon_only && !caption.is_empty() {
         missing = pdfcraft_fonts::first_undrawable(&caption);
-        let size = ((height - 4.0) * 0.6).clamp(4.0, 14.0);
-        let tw = helvetica_width(&caption, size);
-        content.extend(format!("BT /Helv {size:.2} Tf 0 g 1 0 0 1 {:.3} {:.3} Tm ", (width - tw) / 2.0, (height - size * 0.7) / 2.0).bytes());
-        content.extend(literal(&win_ansi(&caption)));
-        content.extend_from_slice(b" Tj ET\n");
+        let mut size = ((height - 4.0) * 0.6).clamp(4.0, 14.0);
+        let inner = (width - 4.0).max(1.0);
+        if helvetica_width(&caption, size) <= inner {
+            let tw = helvetica_width(&caption, size);
+            content.extend(format!("BT /Helv {size:.2} Tf 0 g 1 0 0 1 {:.3} {:.3} Tm ", (width - tw) / 2.0, (height - size * 0.7) / 2.0).bytes());
+            content.extend(literal(&win_ansi(&caption)));
+            content.extend_from_slice(b" Tj ET\n");
+        } else {
+            // A caption wider than its button: on as many centred lines as it needs, at the
+            // largest size at which they fit the height, and clipped to the button so nothing
+            // runs out of it.
+            let lines = loop {
+                let lines = pdfcraft_fonts::wrap(&caption, size, inner);
+                if lines.len() as f64 * size * 1.15 <= height - 4.0 || size <= 4.0 {
+                    break lines;
+                }
+                size = (size - 0.5).max(4.0);
+            };
+            let leading = size * 1.15;
+            let block = lines.len() as f64 * leading;
+            content.extend(format!("q 1 1 {:.3} {:.3} re W n\nBT /Helv {size:.2} Tf 0 g\n", (width - 2.0).max(0.0), (height - 2.0).max(0.0)).bytes());
+            for (i, line) in lines.iter().take(MAX_CAPTION_LINES).enumerate() {
+                let line = line.trim();
+                let tw = helvetica_width(line, size);
+                let y = (height + block) / 2.0 - leading * i as f64 - size * 0.85 - (leading - size) / 2.0;
+                content.extend(format!("1 0 0 1 {:.3} {:.3} Tm ", (width - tw) / 2.0, y).bytes());
+                content.extend(literal(&win_ansi(line)));
+                content.extend_from_slice(b" Tj\n");
+            }
+            content.extend_from_slice(b"ET\nQ\n");
+        }
     }
     let mut font = Dict::new();
     font.set(b"Type".to_vec(), Object::name("Font"));

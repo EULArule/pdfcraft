@@ -268,6 +268,9 @@ pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, xf: &PageXform,
         for (wi, w) in f.widgets.iter().enumerate().filter(|(_, w)| w.page == Some(page) && !w.hidden) {
             let r = widget_rect(xf, info, page, w.rect);
             let focused = view.forms.focus.as_ref().is_some_and(|x| x.name == f.name && x.widget == wi);
+            if f.kind == FormFieldKind::Combo && fillable(f) {
+                paint_drop_down_arrow(painter, r);
+            }
             if focused {
                 painter.rect_stroke(r.expand(1.0), CornerRadius::same(2), Stroke::new(2.0, FOCUS_BLUE), egui::StrokeKind::Outside);
             } else {
@@ -280,6 +283,25 @@ pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, xf: &PageXform,
             }
         }
     }
+}
+
+/// The arrow at the right of a drop-down that can be opened: the viewer's own mark (as in other
+/// viewers), not part of the page, so it is neither printed nor saved. Left out where the box is
+/// too small to hold it beside a value.
+fn paint_drop_down_arrow(painter: &egui::Painter, r: Rect) {
+    let side = r.height().min(16.0);
+    if side < 6.0 || r.width() < side * 2.0 {
+        return;
+    }
+    let button = Rect::from_min_max(egui::pos2(r.right() - side, r.top()), r.right_bottom()).shrink(1.0);
+    painter.rect_filled(button, CornerRadius::same(1), Color32::from_gray(0xE4));
+    painter.rect_stroke(button, CornerRadius::same(1), Stroke::new(1.0, Color32::from_gray(0x9A)), egui::StrokeKind::Inside);
+    let (c, k) = (button.center(), button.width().min(button.height()) * 0.22);
+    painter.add(egui::Shape::convex_polygon(
+        vec![egui::pos2(c.x - k, c.y - k * 0.5), egui::pos2(c.x + k, c.y - k * 0.5), egui::pos2(c.x, c.y + k * 0.7)],
+        Color32::from_gray(0x30),
+        Stroke::NONE,
+    ));
 }
 
 fn paint_unbaked_widget(painter: &egui::Painter, xf: &PageXform, f: &FormField, w: &FormWidget, r: Rect) {

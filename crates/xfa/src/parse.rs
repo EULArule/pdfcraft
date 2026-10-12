@@ -15,6 +15,10 @@ const MAX_NODES: u32 = 2_000_000;
 const MAX_IMAGE: usize = 32 << 20;
 /// Most items a choice list keeps.
 const MAX_ITEMS: usize = 1000;
+/// Most script objects kept from a template.
+const MAX_SCRIPT_OBJECTS: usize = 500;
+/// Most cells a comb field may have.
+const MAX_COMB_CELLS: usize = 500;
 /// Longest text run kept.
 const MAX_TEXT: usize = 1 << 20;
 
@@ -171,6 +175,7 @@ fn parse_common(n: XmlNode) -> Common {
         id: n.attribute("id").map(str::to_string),
         x: attr_measure(n, "x"),
         y: attr_measure(n, "y"),
+        anchor: Anchor::parse(n.attribute("anchorType")),
         w: attr_measure(n, "w"),
         h: attr_measure(n, "h"),
         min_w: attr_measure(n, "minW"),
@@ -367,7 +372,8 @@ fn parse_caption(n: Option<XmlNode>, warnings: &mut Vec<String>) -> Option<Capti
             Some("inline") => Placement::Inline,
             _ => Placement::Left,
         },
-        reserve: attr_measure(n, "reserve").filter(|r| *r >= 0.0),
+        // A reserve of zero is the default: the caption takes what its text needs.
+        reserve: attr_measure(n, "reserve").filter(|r| *r > 0.0),
         presence: Presence::parse(n.attribute("presence")),
         value: parse_value(child(n, "value"), warnings),
         font: parse_font(child(n, "font")),
@@ -461,6 +467,11 @@ fn parse_field(n: XmlNode, warnings: &mut Vec<String>) -> Field {
         item_values,
         choice,
         max_chars,
+        comb: ui_el
+            .and_then(|e| child(e, "comb"))
+            .and_then(|c| c.attribute("numberOfCells"))
+            .and_then(|c| c.trim().parse::<usize>().ok())
+            .filter(|c| (1..=MAX_COMB_CELLS).contains(c)),
         tooltip: child(n, "assist").and_then(|a| child(a, "toolTip")).map(text_of).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
         access: match n.attribute("access") {
             Some("readOnly") => Access::ReadOnly,
@@ -471,6 +482,7 @@ fn parse_field(n: XmlNode, warnings: &mut Vec<String>) -> Field {
         picture: ui.and_then(|u| child(u, "picture")).map(text_of).map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
         scripts,
         calculate: child(n, "calculate").and_then(|c| child(c, "script")).map(|s| parse_script(s, "calculate")),
+        required: validate_el.is_some_and(|v| v.attribute("nullTest") == Some("error")),
         validate: validate_el.and_then(|v| child(v, "script")).map(|s| parse_script(s, "validate")),
         validate_message,
         numeric,
@@ -681,7 +693,24 @@ pub fn parse(xml: &str) -> Result<(Template, Vec<String>), XfaError> {
     }
     let mut page_roles = Vec::new();
     collect_page_roles(&[Node::Subform(Box::new(root_sf.clone()))], &mut page_roles, 0);
-    Ok((Template { root: root_sf, page_roles }, warnings))
+    // Script objects, wherever a subform declares them: event scripts name them without a
+    // path, and forms keep the names apart.
+    let mut script_objects: Vec<ScriptObject> = Vec::new();
+    for v in template.descendants().filter(|n| n.is_element() && n.tag_name().name() == "variables") {
+        for sc in children(v, "script") {
+            let Some(name) = sc.attribute("name").map(str::trim).filter(|n| !n.is_empty()) else { continue };
+            if script_objects.len() >= MAX_SCRIPT_OBJECTS {
+                warnings.push(format!("the form has more than {MAX_SCRIPT_OBJECTS} script objects; the rest are left out"));
+                break;
+            }
+            if script_objects.iter().any(|o| o.name == name) {
+                continue;
+            }
+            let parsed = parse_script(sc, "");
+            script_objects.push(ScriptObject { name: name.to_string(), text: parsed.text, formcalc: parsed.formcalc });
+        }
+    }
+    Ok((Template { root: root_sf, script_objects, page_roles }, warnings))
 }
 
 fn parse_access(a: Option<&str>) -> Option<Access> {

@@ -1,11 +1,12 @@
 //! Turn laid-out pages into PDF objects inside an open document: page dictionaries with content
-//! streams (standard-14 fonts, WinAnsi), image XObjects and AcroForm widgets. Widget appearance
+//! streams (standard-14 fonts, WinAnsi and an extended encoding for the Latin letters WinAnsi
+//! lacks), image XObjects and AcroForm widgets. Widget appearance
 //! streams are left empty here; the forms layer regenerates them from the field dictionaries.
 
 use std::collections::{BTreeMap, HashMap};
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString, Stream};
-use pdfcraft_fonts::{literal, win_ansi};
+use pdfcraft_fonts::{literal, standard14, win_ansi_byte};
 
 use crate::XfaError;
 use crate::layout::{Action, BorderShape, Form, Item, Page, Widget, WidgetKind};
@@ -17,6 +18,12 @@ pub const SOM_KEY: &[u8] = b"PCSom";
 /// Private key on the AcroForm: what laying the form out produced, so a reopened file is not
 /// laid out again.
 pub const LAYOUT_KEY: &[u8] = b"PCXfaLayout";
+/// Which layout wrote the pages and fields a file carries, in the [`LAYOUT_KEY`] mark's
+/// `/Version`. Raised when the layout learns something a saved form should get too (required
+/// fields, anchors, the extended encoding…): a form laid out by an older PdfCraft is then laid
+/// out again from its template and data when it is opened.
+pub const LAYOUT_VERSION: i64 = 2;
+
 /// Private key on generated push buttons whose template has a click script: the button has no
 /// PDF action (the script is XFA's, not Acrobat JavaScript); PdfCraft runs the script by the
 /// field's SOM path.
@@ -118,6 +125,36 @@ fn standard_font(base: &str) -> Object {
     Object::Dict(f)
 }
 
+/// A standard font whose codes from [`standard14::EXTENDED_FIRST`] up are the Latin letters
+/// WinAnsiEncoding lacks (ă, ș, ț, ő, ł, …): the font has the glyphs, the encoding names them.
+fn extended_font(base: &str, (encoding, to_unicode): (ObjRef, ObjRef)) -> Object {
+    let mut f = Dict::new();
+    f.set(b"Type".to_vec(), Object::name("Font"));
+    f.set(b"Subtype".to_vec(), Object::name("Type1"));
+    f.set(b"BaseFont".to_vec(), Object::name(base));
+    f.set(b"Encoding".to_vec(), Object::Ref(encoding));
+    f.set(b"ToUnicode".to_vec(), Object::Ref(to_unicode));
+    Object::Dict(f)
+}
+
+/// Text as the strings to show: runs in WinAnsiEncoding (`false`) and in the extended encoding
+/// (`true`), in order. What neither has is written as `?`.
+fn encoded_runs(text: &str) -> Vec<(bool, Vec<u8>)> {
+    let mut out: Vec<(bool, Vec<u8>)> = Vec::new();
+    for c in text.chars() {
+        let (extended, byte) = match (if c == '\t' { Some(b' ') } else { win_ansi_byte(c) }, standard14::extended_code(c)) {
+            (Some(b), _) => (false, b),
+            (None, Some(b)) => (true, b),
+            (None, None) => (false, b'?'),
+        };
+        match out.last_mut() {
+            Some((e, bytes)) if *e == extended => bytes.push(byte),
+            _ => out.push((extended, vec![byte])),
+        }
+    }
+    out
+}
+
 /// Every face the content streams or `/DA` strings may name.
 fn all_faces() -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
@@ -182,6 +219,8 @@ struct Emitter<'a> {
     warnings: Vec<String>,
     /// The signatures the file holds, by the SOM path of the field signed.
     signed: HashMap<String, Signed>,
+    /// The extended encoding and its `/ToUnicode` CMap, once some text needed them.
+    extended_encoding: Option<(ObjRef, ObjRef)>,
 }
 
 /// A signature field of the file that has been signed.
@@ -275,6 +314,11 @@ impl Emitter<'_> {
         if w.read_only {
             ff |= 1;
         }
+        // Required: viewers mark such fields when they highlight a form's fields. A radio
+        // button's flags are its group's, which has none.
+        if w.required && !matches!(w.kind, WidgetKind::Radio { .. }) {
+            ff |= 1 << 1;
+        }
         let mut top_level = true;
         match &w.kind {
             WidgetKind::Text | WidgetKind::Date(_) | WidgetKind::Password => {
@@ -287,6 +331,11 @@ impl Emitter<'_> {
                 }
                 if let Some(m) = w.max_chars {
                     d.set(b"MaxLen".to_vec(), Object::Int(m.min(100_000) as i64));
+                }
+                if let Some(cells) = w.comb.filter(|_| w.kind == WidgetKind::Text) {
+                    // A comb: one character per cell, as many characters as cells.
+                    ff |= 1 << 24;
+                    d.set(b"MaxLen".to_vec(), Object::Int(cells as i64));
                 }
                 let q = match w.h_align {
                     crate::model::HAlign::Center => 1,
@@ -488,7 +537,7 @@ impl Emitter<'_> {
         Ok(Some(r))
     }
 
-    /// An image XObject for a picture: JPEGs as they are (`DCTDecode`), PNGs and GIFs decoded
+    /// An image XObject for a picture: JPEGs as they are (`DCTDecode`), PNGs, GIFs and BMPs decoded
     /// to samples (`FlateDecode`, with a soft mask for transparency). `None`, with a warning,
     /// for anything else.
     fn image_xobject(&mut self, data: &[u8], content_type: &str) -> Option<ObjRef> {
@@ -536,7 +585,7 @@ impl Emitter<'_> {
                 d.set(b"Filter".to_vec(), Object::name("DCTDecode"));
                 Some(self.doc.add(Object::Stream(Stream::from_raw(d, data.to_vec()))))
             }
-            Some(crate::image::Kind::Png | crate::image::Kind::Gif) => {
+            Some(crate::image::Kind::Png | crate::image::Kind::Gif | crate::image::Kind::Bmp) => {
                 let img = match crate::image::decode(data) {
                     Ok(img) => img,
                     Err(why) => {
@@ -561,7 +610,7 @@ impl Emitter<'_> {
                 Some(self.doc.add(Object::Stream(Stream::flate(d, &img.samples))))
             }
             None => {
-                self.warnings.push(format!("a {what} image is not a JPEG, PNG or GIF and is left out"));
+                self.warnings.push(format!("a {what} image is not a JPEG, PNG, GIF or BMP and is left out"));
                 None
             }
         }
@@ -571,6 +620,8 @@ impl Emitter<'_> {
         let page_ref = self.doc.add(Object::Dict(Dict::new()));
         let mut content: Vec<u8> = Vec::new();
         let mut fonts: BTreeMap<&'static str, &'static str> = BTreeMap::new();
+        // Faces some text needs in the extended encoding: resource `<name>X`.
+        let mut extended_fonts: BTreeMap<&'static str, &'static str> = BTreeMap::new();
         let mut xobjects = Dict::new();
         let mut annots = Vec::new();
         let h = page.height;
@@ -597,7 +648,9 @@ impl Emitter<'_> {
                 Item::Text(s) => {
                     // The form's own text, set in the standard fonts: what they can't draw is
                     // shown as `?` and reported once (the layout goes on), never silently.
-                    if let Some(c) = pdfcraft_fonts::first_undrawable(&s.text) {
+                    if let Some(c) =
+                        s.text.chars().find(|c| !matches!(c, '\n' | '\r' | '\t') && win_ansi_byte(*c).is_none() && !standard14::has_glyph(*c))
+                    {
                         const PREFIX: &str = "some of the form's text has characters the standard fonts can't draw";
                         if !self.warnings.iter().any(|w| w.starts_with(PREFIX)) {
                             self.warnings.push(format!(
@@ -608,12 +661,20 @@ impl Emitter<'_> {
                         }
                     }
                     let name = s.face.resource_name();
-                    fonts.insert(name, s.face.family.base_font(s.face.bold, s.face.italic));
-                    content.extend(
-                        format!("BT /{name} {} Tf {} rg 1 0 0 1 {} {} Tm ", n(s.face.size), rgb(s.face.color), n(s.x), n(h - s.baseline)).bytes(),
-                    );
-                    content.extend(literal(&win_ansi(&s.text)));
-                    content.extend_from_slice(b" Tj ET\n");
+                    let base = s.face.base_font();
+                    content.extend(format!("BT {} rg 1 0 0 1 {} {} Tm", rgb(s.face.color), n(s.x), n(h - s.baseline)).bytes());
+                    for (extended, bytes) in encoded_runs(&s.text) {
+                        if extended {
+                            extended_fonts.insert(name, base);
+                            content.extend(format!(" /{name}X {} Tf ", n(s.face.size)).bytes());
+                        } else {
+                            fonts.insert(name, base);
+                            content.extend(format!(" /{name} {} Tf ", n(s.face.size)).bytes());
+                        }
+                        content.extend(literal(&bytes));
+                        content.extend_from_slice(b" Tj");
+                    }
+                    content.extend_from_slice(b" ET\n");
                 }
                 Item::Image { rect, data, content_type } => {
                     let Some(r) = self.image_xobject(data, content_type) else { continue };
@@ -631,6 +692,20 @@ impl Emitter<'_> {
         let mut font_dict = Dict::new();
         for (name, base) in fonts {
             font_dict.set(name.as_bytes().to_vec(), standard_font(base));
+        }
+        if !extended_fonts.is_empty() {
+            let encoding = match self.extended_encoding {
+                Some(r) => r,
+                None => {
+                    let encoding = self.doc.add(Object::Dict(standard14::extended_encoding()));
+                    let to_unicode = self.doc.add(Object::Stream(Stream::flate(Dict::new(), &standard14::extended_to_unicode())));
+                    self.extended_encoding = Some((encoding, to_unicode));
+                    (encoding, to_unicode)
+                }
+            };
+            for (name, base) in extended_fonts {
+                font_dict.set(format!("{name}X").into_bytes(), extended_font(base, encoding));
+            }
         }
         let mut res = Dict::new();
         res.set(b"Font".to_vec(), Object::Dict(font_dict));
@@ -708,6 +783,7 @@ pub fn write_form(doc: &mut Document, form: &Form) -> Result<Written, XfaError> 
         field_count: 0,
         warnings: Vec::new(),
         signed,
+        extended_encoding: None,
     };
     let mut kids = Vec::new();
     for page in &form.pages {
@@ -760,6 +836,7 @@ pub fn write_form(doc: &mut Document, form: &Form) -> Result<Written, XfaError> 
         acro.set(b"DA".to_vec(), Object::String(PdfString::literal(b"/Helv 0 Tf 0 g".to_vec())));
     }
     let mut mark = Dict::new();
+    mark.set(b"Version".to_vec(), Object::Int(LAYOUT_VERSION));
     mark.set(b"Pages".to_vec(), Object::Int(count as i64));
     mark.set(b"Fields".to_vec(), Object::Int(field_count as i64));
     mark.set(b"Warnings".to_vec(), Object::Array(warnings.iter().map(|w| Object::String(PdfString::text(w))).collect()));
@@ -798,6 +875,26 @@ pub fn existing_layout(doc: &Document) -> Option<crate::Report> {
         fields: mark.int(b"Fields").unwrap_or(0).clamp(0, 1_000_000) as usize,
         template_bytes: 0,
         warnings,
+    })
+}
+
+/// Whether the layout a document carries was written by an older layout than this one, and can
+/// be written again: not when one of its generated fields has been signed since, because laying
+/// the form out again would replace the pages and the field that signature covers.
+pub fn layout_is_stale(doc: &Document) -> bool {
+    let Some(root) = doc.root() else { return false };
+    let catalog = doc.get(root);
+    let Some(acro) = catalog.as_dict().and_then(|c| c.get(b"AcroForm")).map(|a| doc.resolve(a)) else { return false };
+    let Some(acro) = acro.as_dict() else { return false };
+    let Some(mark) = acro.get(LAYOUT_KEY).map(|m| doc.resolve(m)) else { return false };
+    if mark.as_dict().and_then(|m| m.int(b"Version")).unwrap_or(1) >= LAYOUT_VERSION {
+        return false;
+    }
+    let fields = acro.get(b"Fields").map(|f| doc.resolve(f)).and_then(|f| f.as_array().cloned()).unwrap_or_default();
+    !fields.iter().take(MAX_FIELDS_SEARCHED).any(|f| {
+        let f = doc.resolve(f);
+        f.as_dict()
+            .is_some_and(|d| d.contains(SOM_KEY) && d.name(b"FT") == Some(b"Sig") && d.get(b"V").is_some_and(|v| doc.resolve(v).as_dict().is_some()))
     })
 }
 
