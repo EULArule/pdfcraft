@@ -674,6 +674,13 @@ pub fn parse(xml: &str) -> Result<(Template, Vec<String>), XfaError> {
     } else {
         root.descendants().find(is_template).ok_or_else(|| XfaError::Malformed("no <template> element".into()))?
     };
+    // Prototype references resolved: the template written again without them, and read from that.
+    let expanded = crate::proto::expand(template);
+    let expanded_doc = match &expanded {
+        Some(xml) if crate::xml_nesting_depth(xml) <= crate::MAX_XML_DEPTH => roxmltree::Document::parse_with_options(xml, opts).ok(),
+        _ => None,
+    };
+    let template = expanded_doc.as_ref().map_or(template, |d| d.root_element());
     let mut warnings = Vec::new();
     let sf = children(template, "subform").next().ok_or_else(|| XfaError::Malformed("the template has no root subform".into()))?;
     let mut root_sf = parse_subform(sf, &mut warnings, 0);
@@ -710,7 +717,7 @@ pub fn parse(xml: &str) -> Result<(Template, Vec<String>), XfaError> {
             script_objects.push(ScriptObject { name: name.to_string(), text: parsed.text, formcalc: parsed.formcalc });
         }
     }
-    Ok((Template { root: root_sf, script_objects, page_roles }, warnings))
+    Ok((Template { root: root_sf, script_objects, page_roles, fonts: Default::default() }, warnings))
 }
 
 fn parse_access(a: Option<&str>) -> Option<Access> {

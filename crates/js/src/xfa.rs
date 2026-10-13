@@ -980,6 +980,14 @@ fn noop(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
 }
 
+/// The container expression and subform name of a SOM expression whose last step names an
+/// instance manager (`Table1._Row` is `("Table1", "Row")`).
+fn instance_manager_expr(expr: &str) -> Option<(&str, &str)> {
+    let (container, last) = expr.rsplit_once('.').unwrap_or(("", expr));
+    let name = last.strip_prefix('_')?;
+    (!name.is_empty() && !name.contains('[')).then_some((container, name))
+}
+
 /// `resolveNode(som)` / `resolveNodes(som)` bound to node `from`.
 fn resolver(ctx: &mut Context, from: usize, many: bool) -> JsResult<JsValue> {
     let key = ObjectInitializer::new(ctx)
@@ -990,6 +998,19 @@ fn resolver(ctx: &mut Context, from: usize, many: bool) -> JsResult<JsValue> {
         let from = key.get(js_string!("from"), ctx)?.to_number(ctx)? as usize;
         let many = key.get(js_string!("many"), ctx)?.to_boolean();
         let expr = text(&arg(args, 0), ctx)?;
+        // An instance manager (`Table._Row`): the subform is found as any name is, and its
+        // manager is its parent's.
+        if !many && let Some((container, name)) = instance_manager_expr(expr.trim()) {
+            let subform = if container.is_empty() { name.to_string() } else { format!("{container}.{name}") };
+            let parent = {
+                let h = host(ctx)?.borrow();
+                resolve_som(&h, from, &subform).first().and_then(|i| h.nodes.get(*i)).and_then(|n| n.parent)
+            };
+            return match parent {
+                Some(p) => instance_manager(ctx, p, name),
+                None => Ok(JsValue::null()),
+            };
+        }
         let found = resolve_som(&host(ctx)?.borrow(), from, &expr);
         if many {
             return list_object(ctx, &found);

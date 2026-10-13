@@ -589,7 +589,9 @@ pub fn template_of(doc: &Document) -> Result<Template, XfaError> {
     if packets.xdp.trim().is_empty() {
         return Err(XfaError::Malformed("the XFA packets hold no template".into()));
     }
-    crate::parse(&packets.xdp).map(|(t, _)| t)
+    let (mut tpl, _) = crate::parse(&packets.xdp)?;
+    tpl.fonts = crate::text::Fonts::of(doc);
+    Ok(tpl)
 }
 
 /// The template field the object at `som` is an instance of, when it is a field outside an

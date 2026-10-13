@@ -25,6 +25,15 @@ Today it holds what generated appearances need without a font program:
   `set_undrawn_mark` (`UNDRAWN_MARK`, read back by `undrawn_mark`) so the edit is reported and
   flattening refuses. `script_missing` names what the typed-signature script font and its Inter fallback both lack.
 
+- `form_fonts`: the complete, embeddable TrueType/OpenType programs a form carries in its default
+  resources (`/AcroForm /DR /Font`, where form designers embed a form's typefaces): each one's
+  family, weight, posture and advances (`form_faces`), and a Unicode (Identity-H) font over the
+  same program (`unicode_font`, built by `embedding::embed_existing`: the program is referenced,
+  never copied, and the font is kept in `/DR` as `PCF<object number>` so it is made once).
+  Subsets, programs whose licence bits forbid editing, and anything `embedding::validate`
+  refuses are left out. The XFA layout sets a form's text and fields in these, which is how
+  Cyrillic and Greek forms are drawn without a bundled font.
+
 It also holds the fonts of the optional [craft-fonts](https://github.com/storytold/craft-fonts)
 build input. `build.rs` embeds them as `CRAFT_FONTS` when the build sets
 `CRAFT_FONTS_DIR=<checkout>` (and fails if it can't while `CRAFT_FONTS_REQUIRED=1`, as releases

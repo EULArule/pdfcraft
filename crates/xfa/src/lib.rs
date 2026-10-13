@@ -15,6 +15,7 @@ pub mod model;
 pub mod packets;
 pub mod parse;
 pub mod pdf;
+mod proto;
 pub mod script;
 pub mod text;
 
@@ -130,7 +131,7 @@ pub struct Report {
 /// Is this a dynamic XFA form still showing its placeholder pages (one PdfCraft has not laid
 /// out yet)?
 pub fn is_dynamic(doc: &Document) -> bool {
-    existing_layout(doc).is_none() && matches!(read_packets(doc), Ok(Some(p)) if p.needs_rendering || !p.has_fields)
+    existing_layout(doc).is_none() && matches!(read_packets(doc), Ok(Some(p)) if p.needs_rendering || p.dynamic_render || !p.has_fields)
 }
 
 /// Lay a template packet (or whole XDP, whose datasets then fill the fields) out.
@@ -154,7 +155,8 @@ pub fn render_into(doc: &mut Document) -> Result<Report, XfaError> {
     if packets.xdp.trim().is_empty() {
         return Err(XfaError::Malformed("the XFA packets hold no template".into()));
     }
-    let (tpl, parse_warnings) = parse(&packets.xdp)?;
+    let (mut tpl, parse_warnings) = parse(&packets.xdp)?;
+    tpl.fonts = text::Fonts::of(doc);
     let data = parse_datasets(&packets.xdp);
     let laid = apply_overrides(&tpl, &overrides(doc));
     let mut form = layout(&laid, data.as_ref())?;

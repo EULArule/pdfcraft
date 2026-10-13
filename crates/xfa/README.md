@@ -9,10 +9,23 @@ placeholder. This crate reads the template, lays it out, and writes ordinary pag
 fields into the document, so everything else in PdfCraft (rendering, filling, saving, printing,
 the automation tools) works on it unchanged. The engine does this when it opens such a form.
 
+A form is dynamic (`is_dynamic`) when it has `/NeedsRendering true`, when its AcroForm has no
+fields, or when its configuration packet says `<dynamicRender>required</dynamicRender>`. The last
+is a dynamic form a viewer saved: it has real pages (a picture of one layout) and of fields only
+those a template can't hold (signatures), so nothing on those pages can be filled in until the
+template is laid out.
+
 ## What it does
 
 - **Packets** (`read_packets`): the XDP from one stream or the `(name, stream)` array; UTF-8
   and UTF-16; capped at 64 MB.
+- **Prototypes** (`proto`): an element with `use="#id"` or `usehref=".#som(…)"` takes the
+  attributes, content and children of the element it names in the same template, and overrides
+  what it declares itself (children are matched by class and position; a list, a value or a
+  `ui` widget of its own replaces the prototype's). Designer's style sheets work this way: a
+  field's size, border, font and margins are its style's. The template is written again with
+  the references resolved (chains up to 16 deep, 64 MB at most) and parsed from that.
+  References into other documents are not followed.
 - **Template** (`parse`): subforms, areas, fields, draws, exclusion groups, page sets with
   page areas, content areas and media; measurements in mm, cm, in, pt and px; `anchorType`
   (which point of its box an object's `x` and `y` give); fonts, paragraphs,
@@ -23,13 +36,16 @@ the automation tools) works on it unchanged. The engine does this when it opens 
   leaders, `columnWidths` and `colSpan`.
 - **Layout** (`layout`): positioned, `tb`, `lr-tb`/`rl-tb`, `table` and `row` layouts; a
   container without a width is as wide as its content; a field without one is `minW` wide and a
-  draw with `minW` as wide as its text; a caption reserve of zero is what the caption's text
+  draw with `minW` as wide as its text; a field with a minimum height is that tall while empty
+  and grows with its text (without one a multi-line field gets three lines); a tab moves to the
+  next half-inch stop; a caption reserve of zero is what the caption's text
   needs, and a caption beside its field wraps in its reserve; flow across content areas and pages with
   page masters chosen by occurrence; a table's header row repeats after a break; presence
   `hidden` takes no space, `invisible` takes space; repeating subforms get their initial
   instances, in flowed content and in a top-to-bottom container inside positioned content (a
   table in an area) alike; fields that compute the page number or count on layout show the numbers.
-- **PDF** (`pdf::write_form`): pages with content streams in the standard 14 fonts (Arial and
+- **PDF** (`pdf::write_form`): pages with content streams in the form's own faces where it
+  carries them (see Text) and otherwise in the standard 14 fonts (Arial and
   friends → Helvetica, Courier New → Courier, serif faces → Times; nothing is embedded), image
   XObjects, and widgets: text (multi-line, max length, comb, alignment), the Required flag on fields that must be
   filled in (so Highlight fields outlines them in red), date (Acrobat's `AFDate`
@@ -39,13 +55,18 @@ the automation tools) works on it unchanged. The engine does this when it opens 
   its SOM path in `/PCSom`; the AcroForm gets `/PCXfaLayout` so a saved form is not laid out
   twice. The XFA packets stay, so Adobe's viewers keep rendering the form from them.
 
-- **Text** (`text`): measured with the standard fonts' own widths
+- **Text** (`text`): set in the complete faces the form carries in its default resources
+  (`text::Fonts`, from `pdfcraft_fonts::form_fonts`), matched to the template's typeface by
+  family, weight and posture: measured by their widths, written through a Unicode font over the
+  same program, and named in the fields' `/DA` so what is typed is drawn in them. A character
+  the standard fonts lack (Cyrillic, Greek) in a typeface the form doesn't carry is drawn in the
+  nearest face it does carry. Without such faces: measured with the standard fonts' own widths
   (`pdfcraft_fonts::standard14`), so lines break, centre and are underlined where they are
   drawn. Text is written in WinAnsiEncoding; the Latin letters it lacks but the standard fonts
   have (ă, ș, ț, ő, ł, ğ, ě, … — Romanian, Central European, Baltic, Turkish) go through a second
   font resource (`TiRoX` beside `TiRo`) whose `/Differences` name the glyphs, with a
-  `/ToUnicode` map so the text reads back. What no standard font has (CJK, Cyrillic, Greek) is
-  still shown as `?` and reported once.
+  `/ToUnicode` map so the text reads back. What neither the form's faces nor a standard font
+  has (CJK; Cyrillic and Greek in a form that embeds no font) is shown as `?` and reported once.
 
 - **Data** (`data`): the `datasets` packet. On layout, a field takes its value from the data
   node at its data path: its SOM path without areas, which are named in SOM expressions but are
@@ -97,6 +118,15 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
 ```
 
 ## Deliberately not done (yet)
+
+- **Repeating subforms that need not occur** (`occur min="0"`) start with one instance, not
+  none: the script model finds a subform's instance manager through its instances.
+- **Signatures made before the layout.** A signed box shows its signature (found by SOM path,
+  nameless subforms left out), but the signature check sees the laid-out pages as pages added
+  after signing and calls the signature invalid; the fields the file came with stay in the
+  AcroForm beside the laid-out ones.
+- **Display pictures** on read-only values (a date shown as `DD.MM.YYYY`), dotted and dashed
+  field borders, and round check buttons are drawn plainly.
 
 - **Data binding** is the default one only: explicit `bind ref` expressions, global binding and
   data descriptions are not followed (a data description is kept as written, not checked).

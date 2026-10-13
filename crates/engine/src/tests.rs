@@ -2800,6 +2800,24 @@ fn a_signed_xfa_signature_box_shows_the_picture_the_file_holds() {
     assert_ne!(at(36 + 108, 36 + 72 + 36), [0, 0, 255, 255]);
 }
 
+/// What is typed into a form that carries its typeface, and a button's caption, are drawn in
+/// that face where the standard fonts lack the letters.
+#[test]
+fn an_xfa_forms_own_font_draws_values_and_captions_in_its_script() {
+    let xdp = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">
+<field name="name" w="3in" h="0.3in"><ui><textEdit/></ui><font typeface="Inter"/></field>
+<field name="add" w="2in" h="0.3in"><ui><button/></ui><font typeface="Inter"/><caption><value><text>Добави</text></value></caption></field>
+</subform></template>"##;
+    let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("form.pdf", None, Arc::new(pdfcraft_xfa::fixtures::shell_with_font(xdp, inter)), None).expect("opens");
+    assert_eq!(s.get(id).unwrap().xfa.as_ref().map(|x| x.warnings.clone()), Some(Vec::new()));
+    s.apply(id, Edit::SetFieldValue { name: "name".into(), value: FieldValue::Text("Иван".into()) }).unwrap();
+    let cos = pdfcraft_cos::Document::open(s.get(id).unwrap().bytes.clone()).unwrap();
+    assert!(pdfcraft_forms::undrawn_fields(&cos).is_empty(), "{:?}", pdfcraft_forms::undrawn_fields(&cos));
+    assert!(page_texts(&s, id)[0].contains("Иван") && page_texts(&s, id)[0].contains("Добави"), "{:?}", page_texts(&s, id));
+}
+
 #[test]
 fn an_xfa_form_without_a_template_opens_with_its_placeholder_and_a_warning() {
     let bytes = Arc::new(pdfcraft_xfa::fixtures::shell("<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"></xdp:xdp>"));

@@ -6,6 +6,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString, Stream};
+use pdfcraft_fonts::form_fonts::{self, FormFace};
+use pdfcraft_fonts::pdf::Metrics;
 use pdfcraft_fonts::{literal, standard14, win_ansi_byte};
 
 use crate::XfaError;
@@ -20,9 +22,9 @@ pub const SOM_KEY: &[u8] = b"PCSom";
 pub const LAYOUT_KEY: &[u8] = b"PCXfaLayout";
 /// Which layout wrote the pages and fields a file carries, in the [`LAYOUT_KEY`] mark's
 /// `/Version`. Raised when the layout learns something a saved form should get too (required
-/// fields, anchors, the extended encoding…): a form laid out by an older PdfCraft is then laid
+/// fields, anchors, the extended encoding, prototypes, the form's own fonts…): a form laid out by an older PdfCraft is then laid
 /// out again from its template and data when it is opened.
-pub const LAYOUT_VERSION: i64 = 2;
+pub const LAYOUT_VERSION: i64 = 3;
 
 /// Private key on generated push buttons whose template has a click script: the button has no
 /// PDF action (the script is XFA's, not Acrobat JavaScript); PdfCraft runs the script by the
@@ -221,6 +223,9 @@ struct Emitter<'a> {
     signed: HashMap<String, Signed>,
     /// The extended encoding and its `/ToUnicode` CMap, once some text needed them.
     extended_encoding: Option<(ObjRef, ObjRef)>,
+    /// The Unicode fonts over the form's own faces that some text or field needed, by the
+    /// face's program: the font, and how it encodes text. `None`: it could not be written.
+    form_fonts: HashMap<ObjRef, Option<(ObjRef, Metrics)>>,
 }
 
 /// A signature field of the file that has been signed.
@@ -236,7 +241,7 @@ const MAX_FIELDS_SEARCHED: usize = 20_000;
 /// Deepest field nesting followed.
 const MAX_FIELD_DEPTH: usize = 32;
 
-/// The signed signature fields the document came with, by full name. Signing applications name
+/// The signed signature fields the document came with, by SOM path. Signing applications name
 /// a dynamic form's fields by their SOM path (`form1[0].page1[0].sign[0]`), which is how a
 /// laid-out signature box finds its signature. Fields of an earlier layout pass are not read.
 fn signed_fields(doc: &Document, catalog: &Dict) -> HashMap<String, Signed> {
@@ -269,7 +274,10 @@ fn signed_fields(doc: &Document, catalog: &Dict) -> HashMap<String, Signed> {
         if is_sig && let Some(value) = d.get(b"V").filter(|v| doc.resolve(v).as_dict().is_some()) {
             // The appearance is on the field when it is its own widget, or on its one widget.
             let appearance = d.get(b"AP").cloned().or_else(|| kids.iter().find_map(|k| doc.resolve(k).as_dict().and_then(|k| k.get(b"AP").cloned())));
-            out.entry(name.clone()).or_insert(Signed { value: value.clone(), appearance });
+            // The layout's SOM paths leave the nameless subforms on the way out
+            // (`form1[0].#subform[2].sign[0]` is `form1[0].sign[0]`).
+            let som = name.split('.').filter(|step| !step.starts_with('#')).collect::<Vec<_>>().join(".");
+            out.entry(som).or_insert(Signed { value: value.clone(), appearance });
         }
         if depth < MAX_FIELD_DEPTH {
             stack.extend(kids.into_iter().map(|k| (k, name.clone(), is_sig, depth + 1)));
@@ -279,8 +287,29 @@ fn signed_fields(doc: &Document, catalog: &Dict) -> HashMap<String, Signed> {
 }
 
 impl Emitter<'_> {
-    fn da(face: &Face) -> Vec<u8> {
-        format!("/{} {} Tf {} rg", face.resource_name(), n(face.size), rgb(face.color)).into_bytes()
+    /// The Unicode font over one of the form's own faces, and its encoding.
+    fn form_font(&mut self, face: &FormFace) -> Option<&(ObjRef, Metrics)> {
+        if !self.form_fonts.contains_key(&face.program) {
+            let font = match form_fonts::unicode_font(self.doc, face) {
+                Ok(font) => self.doc.get(font).as_dict().map(|d| (font, Metrics::from_dict(self.doc, d))),
+                Err(why) => {
+                    self.warnings.push(format!("the form's font {} could not be used for its text ({why}); a standard font stands in", face.name));
+                    None
+                }
+            };
+            self.form_fonts.insert(face.program, font);
+        }
+        self.form_fonts.get(&face.program).and_then(Option::as_ref)
+    }
+
+    /// A field's default appearance: the form's own face where it carries one, so what is
+    /// typed is drawn in it (and in every script it has), else the standard font.
+    fn da(&mut self, face: &Face) -> Vec<u8> {
+        let name = match face.own.clone() {
+            Some(own) if self.form_font(&own).is_some() => own.resource_name(),
+            _ => face.resource_name().to_string(),
+        };
+        format!("/{name} {} Tf {} rg", n(face.size), rgb(face.color)).into_bytes()
     }
 
     fn widget(&mut self, w: &Widget, page: &Page, page_ref: ObjRef) -> Result<Option<ObjRef>, XfaError> {
@@ -292,7 +321,7 @@ impl Emitter<'_> {
         d.set(b"F".to_vec(), Object::Int(4));
         d.set(b"P".to_vec(), Object::Ref(page_ref));
         d.set(b"Rect".to_vec(), Object::Array([x0, y0, x1, y1].iter().map(|v| Object::Real(*v)).collect()));
-        d.set(b"DA".to_vec(), Object::String(PdfString::literal(Self::da(&w.face))));
+        d.set(b"DA".to_vec(), Object::String(PdfString::literal(self.da(&w.face))));
         if let Some(t) = &w.tooltip {
             d.set(b"TU".to_vec(), Object::String(PdfString::text(t)));
         }
@@ -457,7 +486,7 @@ impl Emitter<'_> {
                         g.set(b"Ff".to_vec(), Object::Int((1 << 15) | (1 << 14)));
                         g.set(b"T".to_vec(), Object::String(PdfString::text(group)));
                         g.set(b"V".to_vec(), Object::name("Off"));
-                        g.set(b"DA".to_vec(), Object::String(PdfString::literal(Self::da(&w.face))));
+                        g.set(b"DA".to_vec(), Object::String(PdfString::literal(self.da(&w.face))));
                         g.set(b"Kids".to_vec(), Object::Array(Vec::new()));
                         // The group's SOM path: the button's without its last step.
                         let group_som = w.som.rsplit_once('.').map(|(g, _)| g.to_string()).unwrap_or_else(|| w.som.clone());
@@ -620,6 +649,8 @@ impl Emitter<'_> {
         let page_ref = self.doc.add(Object::Dict(Dict::new()));
         let mut content: Vec<u8> = Vec::new();
         let mut fonts: BTreeMap<&'static str, &'static str> = BTreeMap::new();
+        // The form's own faces some text is set in, by resource name.
+        let mut own_fonts: BTreeMap<String, ObjRef> = BTreeMap::new();
         // Faces some text needs in the extended encoding: resource `<name>X`.
         let mut extended_fonts: BTreeMap<&'static str, &'static str> = BTreeMap::new();
         let mut xobjects = Dict::new();
@@ -646,33 +677,47 @@ impl Emitter<'_> {
                     );
                 }
                 Item::Text(s) => {
-                    // The form's own text, set in the standard fonts: what they can't draw is
-                    // shown as `?` and reported once (the layout goes on), never silently.
-                    if let Some(c) =
-                        s.text.chars().find(|c| !matches!(c, '\n' | '\r' | '\t') && win_ansi_byte(*c).is_none() && !standard14::has_glyph(*c))
-                    {
-                        const PREFIX: &str = "some of the form's text has characters the standard fonts can't draw";
-                        if !self.warnings.iter().any(|w| w.starts_with(PREFIX)) {
-                            self.warnings.push(format!(
-                                "{PREFIX} (the first is \"{}\" (U+{:04X})); they are shown as ? until PdfCraft can embed fonts for them",
-                                c.escape_debug(),
-                                u32::from(c)
-                            ));
-                        }
-                    }
                     let name = s.face.resource_name();
                     let base = s.face.base_font();
                     content.extend(format!("BT {} rg 1 0 0 1 {} {} Tm", rgb(s.face.color), n(s.x), n(h - s.baseline)).bytes());
-                    for (extended, bytes) in encoded_runs(&s.text) {
-                        if extended {
-                            extended_fonts.insert(name, base);
-                            content.extend(format!(" /{name}X {} Tf ", n(s.face.size)).bytes());
-                        } else {
-                            fonts.insert(name, base);
-                            content.extend(format!(" /{name} {} Tf ", n(s.face.size)).bytes());
+                    for (own, text) in s.face.runs(&s.text) {
+                        // In the form's own face, where it carries one that has these letters.
+                        if let Some(own) = &own
+                            && let Some((font, metrics)) = self.form_font(own)
+                            && let Some(bytes) = metrics.encode(&text.replace('\t', " "))
+                        {
+                            let resource = own.resource_name();
+                            content.extend(format!(" /{resource} {} Tf ", n(s.face.size)).bytes());
+                            content.extend(literal(&bytes));
+                            content.extend_from_slice(b" Tj");
+                            own_fonts.insert(resource, *font);
+                            continue;
                         }
-                        content.extend(literal(&bytes));
-                        content.extend_from_slice(b" Tj");
+                        // Else in the standard fonts: what they can't draw is shown as `?` and
+                        // reported once (the layout goes on), never silently.
+                        if let Some(c) =
+                            text.chars().find(|c| !matches!(c, '\n' | '\r' | '\t') && win_ansi_byte(*c).is_none() && !standard14::has_glyph(*c))
+                        {
+                            const PREFIX: &str = "some of the form's text has characters the standard fonts can't draw";
+                            if !self.warnings.iter().any(|w| w.starts_with(PREFIX)) {
+                                self.warnings.push(format!(
+                                    "{PREFIX} (the first is \"{}\" (U+{:04X})), and the form carries no font that has them; they are shown as ?",
+                                    c.escape_debug(),
+                                    u32::from(c)
+                                ));
+                            }
+                        }
+                        for (extended, bytes) in encoded_runs(&text) {
+                            if extended {
+                                extended_fonts.insert(name, base);
+                                content.extend(format!(" /{name}X {} Tf ", n(s.face.size)).bytes());
+                            } else {
+                                fonts.insert(name, base);
+                                content.extend(format!(" /{name} {} Tf ", n(s.face.size)).bytes());
+                            }
+                            content.extend(literal(&bytes));
+                            content.extend_from_slice(b" Tj");
+                        }
                     }
                     content.extend_from_slice(b" ET\n");
                 }
@@ -706,6 +751,9 @@ impl Emitter<'_> {
             for (name, base) in extended_fonts {
                 font_dict.set(format!("{name}X").into_bytes(), extended_font(base, encoding));
             }
+        }
+        for (name, font) in own_fonts {
+            font_dict.set(name.into_bytes(), Object::Ref(font));
         }
         let mut res = Dict::new();
         res.set(b"Font".to_vec(), Object::Dict(font_dict));
@@ -784,6 +832,7 @@ pub fn write_form(doc: &mut Document, form: &Form) -> Result<Written, XfaError> 
         warnings: Vec::new(),
         signed,
         extended_encoding: None,
+        form_fonts: HashMap::new(),
     };
     let mut kids = Vec::new();
     for page in &form.pages {
@@ -799,7 +848,7 @@ pub fn write_form(doc: &mut Document, form: &Form) -> Result<Written, XfaError> 
             }
         })?;
     }
-    let Emitter { doc, fields, field_count, warnings, .. } = em;
+    let Emitter { doc, fields, field_count, warnings, form_fonts, .. } = em;
     let count = kids.len();
     doc.update_dict(pages_ref, |d| {
         d.set(b"Type".to_vec(), Object::name("Pages"));
@@ -818,6 +867,11 @@ pub fn write_form(doc: &mut Document, form: &Form) -> Result<Written, XfaError> 
     acro.set(b"Fields".to_vec(), Object::Array(all));
     let mut dr = acro.get(b"DR").map(|d| doc.resolve(d)).and_then(|d| d.as_dict().cloned()).unwrap_or_default();
     let mut dr_fonts = dr.get(b"Font").map(|f| doc.resolve(f)).and_then(|f| f.as_dict().cloned()).unwrap_or_default();
+    // The Unicode fonts over the form's own faces, where the fields' `/DA` and the next layout
+    // pass find them.
+    for (program, font) in form_fonts.iter().filter_map(|(program, font)| Some((program, font.as_ref()?.0))) {
+        dr_fonts.set(form_fonts::resource_name(*program).into_bytes(), Object::Ref(font));
+    }
     for (name, base) in all_faces() {
         if !dr_fonts.contains(name.as_bytes()) {
             dr_fonts.set(name.as_bytes().to_vec(), standard_font(base));

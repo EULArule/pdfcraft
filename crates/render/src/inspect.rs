@@ -565,8 +565,11 @@ impl<'a> Inspector<'a> {
         }
         info.has_javascript |= info.fields.iter().any(|f| f.has_actions);
         let needs_rendering = catalog.get(b"NeedsRendering").ok().and_then(|o| self.resolve(o).as_bool().ok()).unwrap_or(false);
-        if catalog.get(b"AcroForm").ok().and_then(|o| self.dict(o)).is_some_and(|form| form.get(b"XFA").is_ok()) {
-            info.xfa = Some(if needs_rendering || info.fields.is_empty() { Xfa::Dynamic } else { Xfa::Static });
+        if let Some(form) = catalog.get(b"AcroForm").ok().and_then(|o| self.dict(o))
+            && let Ok(xfa) = form.get(b"XFA")
+        {
+            let dynamic = needs_rendering || info.fields.is_empty() || self.xfa_requires_dynamic_render(xfa);
+            info.xfa = Some(if dynamic { Xfa::Dynamic } else { Xfa::Static });
         }
         self.layers(catalog, &mut info.layers);
         info.layer_groups = self.layer_groups(catalog);
@@ -580,6 +583,35 @@ impl<'a> Inspector<'a> {
             }
             info.has_javascript |= names.get(b"JavaScript").is_ok();
         }
+    }
+
+    /// Whether the XFA configuration packet asks for the form to be laid out from its template
+    /// (`<dynamicRender>required</dynamicRender>`). Such a form's pages are a picture of one
+    /// layout, and its AcroForm holds only the fields a template can't (signatures).
+    fn xfa_requires_dynamic_render(&self, xfa: &'a Object) -> bool {
+        /// Most configuration bytes read: the packet is a few kilobytes (the whole XDP, when
+        /// the form keeps it in one stream, may be more).
+        const MAX_CONFIG: usize = 8 << 20;
+        let stream = match self.resolve(xfa) {
+            Object::Array(items) => {
+                let named = |o: &Object| matches!(o, Object::String(name, _) if name.as_slice() == b"config");
+                let Some(at) = items.iter().position(named) else { return false };
+                items.get(at.saturating_add(1)).map(|o| self.resolve(o))
+            }
+            whole => Some(whole),
+        };
+        let Some(Object::Stream(stream)) = stream else { return false };
+        let bytes = if stream.dict.get(b"Filter").is_ok() {
+            let Ok(bytes) = stream.decompressed_content_with_limit(MAX_CONFIG) else { return false };
+            bytes
+        } else {
+            stream.content.clone()
+        };
+        // Dropping NUL bytes reads the ASCII of a UTF-16 packet as well.
+        let text: String = bytes.iter().filter(|&&b| b != 0).map(|&b| char::from(b)).collect();
+        text.split("<dynamicRender")
+            .skip(1)
+            .any(|rest| rest.split_once('>').and_then(|(_, value)| value.split_once('<')).is_some_and(|(value, _)| value.trim() == "required"))
     }
 
     // ── object helpers ──────────────────────────────────────────────────────────────────────

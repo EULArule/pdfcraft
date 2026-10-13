@@ -781,21 +781,33 @@ fn button_appearance(doc: &Document, w: &Widget) -> (Stream, Option<char>) {
         }
     }
     let mut missing = None;
+    // A caption Helvetica can't draw is set in the button's own font, where the form has one
+    // that can.
+    let mut own: Option<crate::appearance::DaFont> = None;
     if !icon_only && !caption.is_empty() {
         missing = pdfcraft_fonts::first_undrawable(&caption);
+        if missing.is_some() {
+            own = wobj.as_dict().and_then(|d| crate::appearance::DaFont::of(doc, d, &caption));
+            if own.is_some() {
+                missing = None;
+            }
+        }
+        let name = own.as_ref().map_or("Helv", |f| f.name.as_str());
+        let width_of = |s: &str, size: f64| own.as_ref().map_or_else(|| helvetica_width(s, size), |f| f.width(s, size));
+        let encode = |s: &str| own.as_ref().map_or_else(|| win_ansi(s), |f| f.encode(s));
         let mut size = ((height - 4.0) * 0.6).clamp(4.0, 14.0);
         let inner = (width - 4.0).max(1.0);
-        if helvetica_width(&caption, size) <= inner {
-            let tw = helvetica_width(&caption, size);
-            content.extend(format!("BT /Helv {size:.2} Tf 0 g 1 0 0 1 {:.3} {:.3} Tm ", (width - tw) / 2.0, (height - size * 0.7) / 2.0).bytes());
-            content.extend(literal(&win_ansi(&caption)));
+        if width_of(&caption, size) <= inner {
+            let tw = width_of(&caption, size);
+            content.extend(format!("BT /{name} {size:.2} Tf 0 g 1 0 0 1 {:.3} {:.3} Tm ", (width - tw) / 2.0, (height - size * 0.7) / 2.0).bytes());
+            content.extend(literal(&encode(&caption)));
             content.extend_from_slice(b" Tj ET\n");
         } else {
             // A caption wider than its button: on as many centred lines as it needs, at the
             // largest size at which they fit the height, and clipped to the button so nothing
             // runs out of it.
             let lines = loop {
-                let lines = pdfcraft_fonts::wrap(&caption, size, inner);
+                let lines = pdfcraft_fonts::wrap_with(&caption, size, inner, width_of);
                 if lines.len() as f64 * size * 1.15 <= height - 4.0 || size <= 4.0 {
                     break lines;
                 }
@@ -803,25 +815,31 @@ fn button_appearance(doc: &Document, w: &Widget) -> (Stream, Option<char>) {
             };
             let leading = size * 1.15;
             let block = lines.len() as f64 * leading;
-            content.extend(format!("q 1 1 {:.3} {:.3} re W n\nBT /Helv {size:.2} Tf 0 g\n", (width - 2.0).max(0.0), (height - 2.0).max(0.0)).bytes());
+            content
+                .extend(format!("q 1 1 {:.3} {:.3} re W n\nBT /{name} {size:.2} Tf 0 g\n", (width - 2.0).max(0.0), (height - 2.0).max(0.0)).bytes());
             for (i, line) in lines.iter().take(MAX_CAPTION_LINES).enumerate() {
                 let line = line.trim();
-                let tw = helvetica_width(line, size);
+                let tw = width_of(line, size);
                 let y = (height + block) / 2.0 - leading * i as f64 - size * 0.85 - (leading - size) / 2.0;
                 content.extend(format!("1 0 0 1 {:.3} {:.3} Tm ", (width - tw) / 2.0, y).bytes());
-                content.extend(literal(&win_ansi(line)));
+                content.extend(literal(&encode(line)));
                 content.extend_from_slice(b" Tj\n");
             }
             content.extend_from_slice(b"ET\nQ\n");
         }
     }
-    let mut font = Dict::new();
-    font.set(b"Type".to_vec(), Object::name("Font"));
-    font.set(b"Subtype".to_vec(), Object::name("Type1"));
-    font.set(b"BaseFont".to_vec(), Object::name("Helvetica"));
-    font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
     let mut fonts = Dict::new();
-    fonts.set(b"Helv".to_vec(), Object::Dict(font));
+    match own {
+        Some(own) => fonts.set(own.name.into_bytes(), own.object),
+        None => {
+            let mut font = Dict::new();
+            font.set(b"Type".to_vec(), Object::name("Font"));
+            font.set(b"Subtype".to_vec(), Object::name("Type1"));
+            font.set(b"BaseFont".to_vec(), Object::name("Helvetica"));
+            font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
+            fonts.set(b"Helv".to_vec(), Object::Dict(font));
+        }
+    }
     let mut res = Dict::new();
     res.set(b"Font".to_vec(), Object::Dict(fonts));
     if !xobjects.is_empty() {

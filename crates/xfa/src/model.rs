@@ -681,6 +681,9 @@ pub struct Template {
     /// Fields that compute the page number or the page count on layout, by `id`, so text that
     /// embeds them can show the numbers.
     pub page_roles: Vec<(String, PageRole)>,
+    /// The complete faces the form carries for its typefaces, which its text is set in (none
+    /// for a template read on its own).
+    pub fonts: crate::text::Fonts,
 }
 
 /// A named script of a `<variables>` element.

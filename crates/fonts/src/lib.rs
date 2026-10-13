@@ -8,6 +8,7 @@
 mod craft;
 pub mod embedding;
 mod encodings;
+pub mod form_fonts;
 pub mod pdf;
 mod script;
 mod shaping;

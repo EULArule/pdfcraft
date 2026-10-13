@@ -1897,13 +1897,14 @@ fn a_bordered_comb_field_has_dividers_between_its_cells() {
     // Four cells of 50 points: dividers at 50, 100 and 150, inside the border.
     style(&mut doc, Some([0.0, 0.0, 0.0]), 1.0, "S");
     assert_eq!(dividers(&doc), ["50 1 m 50 19 l S", "100 1 m 100 19 l S", "150 1 m 150 19 l S"]);
-    // No border colour, no border width, an underline: no dividers.
+    // No border colour, no border width: no dividers.
     style(&mut doc, None, 1.0, "S");
     assert!(dividers(&doc).is_empty());
     style(&mut doc, Some([0.0, 0.0, 0.0]), 0.0, "S");
     assert!(dividers(&doc).is_empty());
+    // An underline: ticks standing on it tell the cells apart.
     style(&mut doc, Some([0.0, 0.0, 0.0]), 1.0, "U");
-    assert_eq!(dividers(&doc).len(), 1, "the underline itself");
+    assert_eq!(dividers(&doc).len(), 4, "the underline itself and three dividers");
     // A hostile cell count draws a bounded number of lines, and none once cells are too narrow.
     style(&mut doc, Some([0.0, 0.0, 0.0]), 1.0, "S");
     set_props(&mut doc, &name, &FieldProps { max_len: Some(Some(100_000)), ..FieldProps::default() }).unwrap();

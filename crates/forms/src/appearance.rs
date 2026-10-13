@@ -158,6 +158,11 @@ impl FontText {
 
     fn width(&self, s: &str, size: f64) -> f64 {
         match self {
+            // A composite font's own widths: its text may be in any script.
+            Self::Simple(metrics) if metrics.composite => match metrics.encode(&s.replace('\t', " ")) {
+                Some(bytes) => metrics.codes(&bytes).into_iter().map(|(code, _)| metrics.width(code)).sum::<f64>() * size,
+                None => helvetica_width(s, size),
+            },
             Self::WinAnsi | Self::Simple(_) => helvetica_width(s, size),
             Self::Unicode(_) => cjk_width(s, size),
         }
@@ -175,9 +180,16 @@ fn dr_font(doc: &Document, name: &str) -> Option<(Object, FontText)> {
     match fd.name(b"Subtype") {
         Some(b"Type1" | b"TrueType" | b"MMType1") => {}
         // Japanese, Chinese and Korean forms: a CID font addressed by Unicode (a non-embedded
-        // `/HeiseiMin-W3` with `/UniJIS-UCS2-H`, say). Embedded CMap streams and Identity-H need
-        // the font's own mapping, so those still fall back to Helvetica.
-        Some(b"Type0") => return Some((entry, FontText::Unicode(UnicodeCMap::from_name(fd.name(b"Encoding")?)?))),
+        // `/HeiseiMin-W3` with `/UniJIS-UCS2-H`, say). A complete embedded face with a
+        // `/ToUnicode` map is written by that map; a subset, or one without the map, still
+        // falls back to Helvetica.
+        Some(b"Type0") => {
+            if let Some(cmap) = fd.name(b"Encoding").and_then(UnicodeCMap::from_name) {
+                return Some((entry, FontText::Unicode(cmap)));
+            }
+            let metrics = Metrics::from_dict(doc, fd);
+            return (!metrics.subset && fd.contains(b"ToUnicode")).then(|| (entry, FontText::Simple(Box::new(metrics))));
+        }
         _ => return None,
     }
     // Symbolic fonts (ZapfDingbats, Symbol) can't show WinAnsi text.
@@ -185,6 +197,30 @@ fn dr_font(doc: &Document, name: &str) -> Option<(Object, FontText)> {
         return None;
     }
     Some((entry, FontText::Simple(Box::new(Metrics::from_dict(doc, fd)))))
+}
+
+/// The font of a widget's default appearance, when the form's resources have it and it can
+/// write `text`: for text Helvetica can't draw (a caption in another script).
+pub(crate) struct DaFont {
+    pub name: String,
+    pub object: Object,
+    text: FontText,
+}
+
+impl DaFont {
+    pub(crate) fn of(doc: &Document, widget: &Dict, text: &str) -> Option<DaFont> {
+        let da = parse_da(&doc.resolve(widget.get(b"DA")?).as_string()?.to_text());
+        let (object, font) = dr_font(doc, &da.font).filter(|(_, font)| font.can_encode(text) && font.first_unencodable(text).is_none())?;
+        Some(DaFont { name: da.font, object, text: font })
+    }
+
+    pub(crate) fn encode(&self, s: &str) -> Vec<u8> {
+        self.text.encode(s)
+    }
+
+    pub(crate) fn width(&self, s: &str, size: f64) -> f64 {
+        self.text.width(s, size)
+    }
 }
 
 fn helvetica() -> Object {
@@ -420,17 +456,11 @@ pub fn field_appearance_drawn(doc: &Document, f: &Field, w: &Widget, values: &[S
                     let cells = f.max_len.unwrap_or(1).max(1);
                     let cell = width / cells as f64;
                     // A bordered comb has a divider between its cells, in the border's colour
-                    // (not under an underline border, and not where cells are too narrow to tell
-                    // apart).
+                    // (over an underline border too: ticks standing on the line; not where
+                    // cells are too narrow to tell apart).
                     let mk = wd.get(b"MK").map(|m| doc.resolve(m)).and_then(|m| m.as_dict().cloned());
-                    let underline = wd
-                        .get(b"BS")
-                        .map(|b| doc.resolve(b))
-                        .and_then(|b| b.as_dict().and_then(|b| b.name(b"S").map(|s| s == b"U")))
-                        .unwrap_or(false);
                     if let Some(bc) = color_array(doc, mk.as_ref(), b"BC")
                         && bw > 0.0
-                        && !underline
                         && cell >= 2.0 * bw + 1.0
                     {
                         c.push_str(&format!("{}\n{} w\n", stroke_op(&bc), n(bw)));

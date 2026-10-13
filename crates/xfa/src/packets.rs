@@ -18,6 +18,17 @@ pub struct Packets {
     pub needs_rendering: bool,
     /// Whether the AcroForm has any fields of its own.
     pub has_fields: bool,
+    /// The configuration packet says the form must be laid out from its template
+    /// (`<dynamicRender>required</dynamicRender>`): its pages are a picture of one layout, and
+    /// the fields on them are only those a template can't hold (signatures).
+    pub dynamic_render: bool,
+}
+
+/// Whether an XDP's configuration asks for dynamic rendering (XFA 3.3 config, `dynamicRender`).
+pub fn requires_dynamic_render(xdp: &str) -> bool {
+    xdp.split("<dynamicRender")
+        .skip(1)
+        .any(|rest| rest.split_once('>').and_then(|(_, value)| value.split_once('<')).is_some_and(|(value, _)| value.trim() == "required"))
 }
 
 /// How a packet's bytes encode its text.
@@ -152,8 +163,9 @@ pub fn read_packets(doc: &Document) -> Result<Option<Packets>, XfaError> {
         // Not a stream or an array: an XFA entry all the same, with nothing to lay out.
         _ => {}
     }
+    let dynamic_render = requires_dynamic_render(&xdp);
     if !xdp.contains("<template") {
         xdp.clear();
     }
-    Ok(Some(Packets { xdp, needs_rendering: needs_rendering.unwrap_or(false), has_fields }))
+    Ok(Some(Packets { xdp, needs_rendering: needs_rendering.unwrap_or(false), has_fields, dynamic_render }))
 }

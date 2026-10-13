@@ -941,7 +941,9 @@ impl Layouter<'_> {
                                 .iter()
                                 .filter(|k| k.common().presence.occupies())
                                 .map(|k| match k {
-                                    Node::Subform(r) if r.layout == Layout::Row => self.row_height(r, &cols, inner_w, &ctx, depth + 1),
+                                    Node::Subform(r) if r.layout == Layout::Row => {
+                                        self.row_height(r, &cols, inner_w, &ctx, depth + 1) * self.instances(k, &som) as f64
+                                    }
                                     _ => self.size_of(k, inner_w, &ctx, depth + 1).1,
                                 })
                                 .sum()
@@ -1003,13 +1005,13 @@ impl Layouter<'_> {
             Value::Rich(r) => r.clone(),
             _ => return 0.0,
         };
-        text::natural_width(&rich, &ctx.para, &Face::of(&ctx.font), &|id| self.embed(id))
+        text::natural_width(&rich, &ctx.para, &Face::of(&ctx.font, &self.tpl.fonts), &|id| self.embed(id))
     }
 
     fn value_height(&self, v: &Value, w: f64, ctx: &Ctx) -> f64 {
         match v {
-            Value::Text(t) => text::measure_height(&text::plain(t), w, &ctx.para, &Face::of(&ctx.font), &|id| self.embed(id)),
-            Value::Rich(r) => text::measure_height(r, w, &ctx.para, &Face::of(&ctx.font), &|id| self.embed(id)),
+            Value::Text(t) => text::measure_height(&text::plain(t), w, &ctx.para, &Face::of(&ctx.font, &self.tpl.fonts), &|id| self.embed(id)),
+            Value::Rich(r) => text::measure_height(r, w, &ctx.para, &Face::of(&ctx.font, &self.tpl.fonts), &|id| self.embed(id)),
             Value::Image { data, .. } => crate::image::size(data).map_or(w, |(iw, ih)| if iw > 0 { w * ih as f64 / iw as f64 } else { w }),
             Value::Line { .. } | Value::Rectangle(_) | Value::Empty => 0.0,
         }
@@ -1032,19 +1034,25 @@ impl Layouter<'_> {
                     Value::Rich(r) => r.clone(),
                     other => text::plain(&other.plain().unwrap_or_default()),
                 };
-                text::measure_height(&rich, inner_w, &para, &Face::of(&font), &|id| self.embed(id))
+                text::measure_height(&rich, inner_w, &para, &Face::of(&font, &self.tpl.fonts), &|id| self.embed(id))
             }
-            _ => (Face::of(&font).width(&cap.value.plain().unwrap_or_default()) + 2.0).min(inner_w * 0.6),
+            _ => (Face::of(&font, &self.tpl.fonts).width(&cap.value.plain().unwrap_or_default()) + 2.0).min(inner_w * 0.6),
         });
         Some((placement, reserve))
     }
 
     fn field_height(&self, f: &Field, inner_w: f64, ctx: &Ctx) -> f64 {
         let font = ctx.font.apply(&f.common.font);
-        let lines = if f.multiline { 3.0 } else { 1.0 };
+        // A field with a minimum height grows from it with its text: empty, it needs one line
+        // and its margins. Without one, a multi-line field gets room for three lines.
+        let (lines, padding) = match (f.common.min_h, f.multiline) {
+            (Some(_), _) => (1.0, 0.0),
+            (None, true) => (3.0, 4.0),
+            (None, false) => (1.0, 4.0),
+        };
         let ui = match f.ui {
             Ui::CheckButton => f.check_size.unwrap_or(10.0).max(text::line_height(font.size)),
-            _ => (text::line_height(font.size) * lines).max(self.grown_text_height(f, inner_w, ctx)) + 4.0 + f.ui_margin.vertical(),
+            _ => (text::line_height(font.size) * lines).max(self.grown_text_height(f, inner_w, ctx)) + padding + f.ui_margin.vertical(),
         };
         match self.caption_reserve(f, inner_w, ctx) {
             Some((Placement::Top | Placement::Bottom, r)) => ui + r,
@@ -1055,9 +1063,13 @@ impl Layouter<'_> {
                         other => text::plain(&other.plain().unwrap_or_default()),
                     };
                     // Beside the field, the caption has its reserve to wrap in.
-                    text::measure_height(&rich, r.min(inner_w).max(1.0), &ctx.para.apply(&c.para), &Face::of(&ctx.font.apply(&c.font)), &|id| {
-                        self.embed(id)
-                    })
+                    text::measure_height(
+                        &rich,
+                        r.min(inner_w).max(1.0),
+                        &ctx.para.apply(&c.para),
+                        &Face::of(&ctx.font.apply(&c.font), &self.tpl.fonts),
+                        &|id| self.embed(id),
+                    )
                 });
                 ui.max(cap.unwrap_or(0.0))
             }
@@ -1081,7 +1093,7 @@ impl Layouter<'_> {
         };
         let w = (inner_w - beside - f.ui_margin.horizontal() - 4.0).max(1.0);
         let font = ctx.font.apply(&f.common.font);
-        text::measure_height(&text::plain(value.trim_end()), w, &ctx.para, &Face::of(&font), &|_| String::new())
+        text::measure_height(&text::plain(value.trim_end()), w, &ctx.para, &Face::of(&font, &self.tpl.fonts), &|_| String::new())
     }
 
     fn group_height(&self, g: &ExclGroup, inner_w: f64, ctx: &Ctx, depth: usize) -> f64 {
@@ -1285,9 +1297,12 @@ impl Layouter<'_> {
                             if let Node::Subform(r) = k
                                 && r.layout == Layout::Row
                             {
-                                let h = self.row_height(r, &cols, inner.w, &ctx, depth + 1);
-                                self.draw_row(r, &cols, Rect::new(inner.x, y, inner.w, h), &ctx, depth + 1, csib)?;
-                                y += h;
+                                // A repeating row: as many as the data holds.
+                                for instance in 0..self.instances(k, &ctx.som) {
+                                    let h = self.row_height(r, &cols, inner.w, &ctx, depth + 1);
+                                    self.draw_row(r, &cols, Rect::new(inner.x, y, inner.w, h), &ctx, depth + 1, csib + instance)?;
+                                    y += h;
+                                }
                             } else {
                                 let (w, h) = self.size_of(k, inner.w, &ctx, depth + 1);
                                 self.draw_node(k, Rect::new(inner.x, y, w, h), &ctx, depth + 1, csib)?;
@@ -1343,7 +1358,7 @@ impl Layouter<'_> {
             Value::Rich(r) => r.clone(),
             _ => return Ok(()),
         };
-        let face = Face::of(font);
+        let face = Face::of(font, &self.tpl.fonts);
         // Text that doesn't fit the height it was given (the template's face is narrower than
         // the standard one drawn in its place, so it wraps to more lines) is drawn smaller,
         // down to 70%, rather than over what lies below.
@@ -1583,14 +1598,16 @@ impl Layouter<'_> {
                     right: f.ui_margin.right + 2.0,
                 };
                 let para = Para { v_align: VAlign::Top, ..fctx.para.clone() };
-                let block = text::layout(&text::plain(value.trim_end()), ui.inset(&m), &para, &Face::of(&fctx.font), &|_| String::new());
+                let block =
+                    text::layout(&text::plain(value.trim_end()), ui.inset(&m), &para, &Face::of(&fctx.font, &self.tpl.fonts), &|_| String::new());
                 return self.push_block(block);
             }
         }
         let face = match (&f.ui, &f.caption) {
             // Buttons show their caption in the caption's font.
-            (Ui::Button, Some(cap)) => Face::of(&ctx.font.apply(&cap.font)),
-            _ => Face::of(&fctx.font),
+            // A button's caption is what it shows: in the button's font, unless it has its own.
+            (Ui::Button, Some(cap)) => Face::of(&fctx.font.apply(&cap.font), &self.tpl.fonts),
+            _ => Face::of(&fctx.font, &self.tpl.fonts),
         };
         let h_align = match (&f.ui, &f.caption) {
             (Ui::Button, Some(cap)) => ctx.para.apply(&cap.para).h_align,

@@ -364,35 +364,60 @@ pub fn shell(xdp: &str) -> Vec<u8> {
     assemble(objs)
 }
 
-/// A dynamic form with two signature boxes of which `sign` has been signed: the file holds the
-/// field a signing application leaves (named by its SOM path, its value a signature dictionary)
-/// and the picture drawn in the box, a solid blue rectangle.
+/// A dynamic form with two signature boxes of which `sign` has been signed, as a viewer saves
+/// one: with the pages it drew and no `/NeedsRendering`, the configuration packet asking for
+/// dynamic rendering, and of fields only the one a signing application leaves (named by its SOM
+/// path, through the nameless subform it is in; its value a signature dictionary) with the
+/// picture drawn in the box, a solid blue rectangle.
 pub fn signed_shell() -> Vec<u8> {
-    let xdp = r##"<?xml version="1.0" encoding="UTF-8"?>
-<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">
-<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">
+    let template = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">
 <subform name="form" layout="tb">
  <pageSet><pageArea name="page"><contentArea x="0.5in" y="0.5in" w="7.5in" h="10in"/><medium short="8.5in" long="11in"/></pageArea></pageSet>
- <subform name="body" layout="tb" w="7.5in">
+ <subform layout="tb" w="7.5in">
   <field name="sign" w="3in" h="1in"><ui><signature/></ui></field>
   <field name="other" w="3in" h="1in"><ui><signature/></ui></field>
  </subform>
 </subform>
 </template>
-</xdp:xdp>
 "##;
+    let config = r#"<config xmlns="http://www.xfa.org/schema/xci/3.0/"><acrobat><acrobat7><dynamicRender>required</dynamicRender></acrobat7></acrobat></config>"#;
+    let open = "<xdp>";
+    let close = "</xdp>";
     let picture = "0 0 1 rg 0 0 100 40 re f";
+    let stream = |text: &str| format!("<< /Length {} >>\nstream\n{text}\nendstream", text.len()).into_bytes();
     let objs: Vec<Vec<u8>> = vec![
-        b"<< /Type /Catalog /Pages 2 0 R /NeedsRendering true /AcroForm << /XFA 5 0 R /Fields [6 0 R] /SigFlags 3 >> >>".to_vec(),
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /XFA [(xdp:xdp) 11 0 R (config) 12 0 R (template) 5 0 R (</xdp:xdp>) 13 0 R] /Fields [6 0 R] /SigFlags 3 >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+        b"<< /Length 44 >>\nstream\nBT /F1 12 Tf 72 700 Td (Please wait...) Tj ET\nendstream".to_vec(),
+        stream(template),
+        b"<< /T (form[0]) /Kids [7 0 R] >>".to_vec(),
+        b"<< /T (#subform[0]) /Parent 6 0 R /Kids [8 0 R] >>".to_vec(),
+        b"<< /T (sign[0]) /Parent 7 0 R /FT /Sig /V 9 0 R /Type /Annot /Subtype /Widget /Rect [0 0 0 0] /AP << /N 10 0 R >> >>".to_vec(),
+        b"<< /Type /Sig /Name (A Signer) >>".to_vec(),
+        format!("<< /Type /XObject /Subtype /Form /BBox [0 0 100 40] /Length {} >>\nstream\n{picture}\nendstream", picture.len()).into_bytes(),
+        stream(open),
+        stream(config),
+        stream(close),
+    ];
+    assemble(objs)
+}
+
+/// [`shell`] whose form carries `font`, a complete TrueType program, among its default
+/// resources (`/AcroForm /DR /Font`), as form designers embed the typefaces a form uses.
+pub fn shell_with_font(xdp: &str, font: &[u8]) -> Vec<u8> {
+    let mut program = format!("<< /Length {0} /Length1 {0} >>\nstream\n", font.len()).into_bytes();
+    program.extend_from_slice(font);
+    program.extend_from_slice(b"\nendstream");
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /NeedsRendering true /AcroForm << /XFA 5 0 R /Fields [] /DR << /Font << /Body 6 0 R >> >> >> >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
         b"<< /Length 44 >>\nstream\nBT /F1 12 Tf 72 700 Td (Please wait...) Tj ET\nendstream".to_vec(),
         format!("<< /Length {} >>\nstream\n{xdp}\nendstream", xdp.len()).into_bytes(),
-        b"<< /T (form[0]) /Kids [7 0 R] >>".to_vec(),
-        b"<< /T (body[0]) /Parent 6 0 R /Kids [8 0 R] >>".to_vec(),
-        b"<< /T (sign[0]) /Parent 7 0 R /FT /Sig /V 9 0 R /Type /Annot /Subtype /Widget /Rect [0 0 0 0] /AP << /N 10 0 R >> >>".to_vec(),
-        b"<< /Type /Sig /Name (A Signer) >>".to_vec(),
-        format!("<< /Type /XObject /Subtype /Form /BBox [0 0 100 40] /Length {} >>\nstream\n{picture}\nendstream", picture.len()).into_bytes(),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /Body /FontDescriptor 7 0 R >>".to_vec(),
+        b"<< /Type /FontDescriptor /FontName /Body /Flags 32 /FontFile2 8 0 R >>".to_vec(),
+        program,
     ];
     assemble(objs)
 }

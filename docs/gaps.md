@@ -238,7 +238,9 @@ update the numbers.
 
 - **Missing:** the wider Acrobat JavaScript object model (annotations, layers, dialogs), document
   actions, the Actions tab triggers that run JavaScript, form submission, the debugger, barcode
-  fields, rich-text values; XFA flattening and complete dynamic-form fidelity.
+  fields, rich-text values; XFA flattening and complete dynamic-form fidelity (a signature made
+  before PdfCraft lays a form out is reported invalid because the pages changed; an optional
+  repeating row starts with one instance; display pictures on read-only values).
 - **Evidence:** `form.js-host` partial, `form.document-actions`, `form.submit-form`,
   `edit.action-javascript`, `form.js-debugger`, `form.xfa-flatten` planned; XFA layout, FormCalc
   and data partial.

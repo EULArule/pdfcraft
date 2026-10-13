@@ -478,6 +478,9 @@ mod xfa_model {
         );
         assert_eq!(o.error, None, "{o:?}");
         assert_eq!(o.result.as_deref(), Some("2/3/form1[0].page1[0].table[0].row[2]/2"));
+        // A SOM expression names the manager too, as Designer's button actions write it.
+        let named = go("this.resolveNode('table._row').addInstance(1); this.resolveNode('table._row').count", "form1[0].page1[0].go[0]", "click");
+        assert_eq!((named.error, named.result.as_deref()), (None, Some("3")));
         assert_eq!(
             o.effects,
             vec![

@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use pdfcraft_cos::{Dict, Document, Object, PdfString, Stream};
+use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString, Stream};
 use skrifa::{
     FontRef, MetadataProvider,
     instance::{LocationRef, Size},
@@ -124,6 +124,40 @@ pub fn embed_mapping(
     family: &str,
     mappings: &[(String, skrifa::GlyphId)],
 ) -> Result<String, String> {
+    let font = unicode_font(doc, bytes, family, mappings, None)?;
+    let mut index = 0usize;
+    while fonts.contains(format!("PCFull{index}").as_bytes()) {
+        index = index.saturating_add(1);
+    }
+    let resource = format!("PCFull{index}");
+    fonts.set(resource.as_bytes().to_vec(), Object::Ref(font));
+    Ok(resource)
+}
+
+/// A Unicode font over a complete program the document already embeds: `program` is that
+/// font file stream and `bytes` what it decodes to. The program is referenced, never copied, so
+/// text the document's own simple fonts can't encode (their encodings stop at 256 codes) is
+/// written with the very face the document carries.
+pub fn embed_existing(doc: &mut Document, program: ObjRef, bytes: &[u8], family: &str) -> Result<ObjRef, String> {
+    let font = FontRef::new(bytes).map_err(|e| e.to_string())?;
+    let mappings: Vec<_> = font
+        .charmap()
+        .mappings()
+        .filter(|(_, gid)| gid.to_u32() > 0)
+        .filter_map(|(cp, gid)| char::from_u32(cp).map(|c| (c.to_string(), gid)))
+        .collect();
+    unicode_font(doc, bytes, family, &mappings, Some(program))
+}
+
+/// The Type 0 font dictionary of [`embed_mapping`], over `program` or (without one) the full
+/// program, added once.
+fn unicode_font(
+    doc: &mut Document,
+    bytes: &[u8],
+    family: &str,
+    mappings: &[(String, skrifa::GlyphId)],
+    program: Option<ObjRef>,
+) -> Result<ObjRef, String> {
     validate(bytes)?;
     if mappings.len() > 65_534 || mappings.iter().any(|(s, _)| s.len() > 4096) {
         return Err("shaped font mapping exceeds its budget".into());
@@ -188,10 +222,13 @@ pub fn embed_mapping(
         Object::Array([bounds.x_min, bounds.y_min, bounds.x_max, bounds.y_max].map(|v| Object::Real(f64::from(v) * scale)).to_vec()),
     );
     // Reuse a full program registered on another page; source subset programs stay untouched.
-    let existing = doc.scan_objects().take(8192).find_map(|(r, o)| match o.as_ref() {
-        Object::Stream(s) if s.dict.get(b"PCFullFont").is_some() && s.raw.as_ref() == bytes => Some(Object::Ref(r)),
-        _ => None,
-    });
+    let existing = match program {
+        Some(r) => Some(Object::Ref(r)),
+        None => doc.scan_objects().take(8192).find_map(|(r, o)| match o.as_ref() {
+            Object::Stream(s) if s.dict.get(b"PCFullFont").is_some() && s.raw.as_ref() == bytes => Some(Object::Ref(r)),
+            _ => None,
+        }),
+    };
     let program = existing.unwrap_or_else(|| {
         let mut d = Dict::new();
         d.set(b"Length1".to_vec(), Object::Int(bytes.len() as i64));
@@ -230,13 +267,7 @@ pub fn embed_mapping(
     top.set(b"Encoding".to_vec(), if cff { stream(doc, cid_encoding.into_bytes()) } else { Object::name("Identity-H") });
     top.set(b"DescendantFonts".to_vec(), Object::Array(vec![descendant]));
     top.set(b"ToUnicode".to_vec(), stream(doc, cmap.into_bytes()));
-    let mut index = 0usize;
-    while fonts.contains(format!("PCFull{index}").as_bytes()) {
-        index = index.saturating_add(1);
-    }
-    let resource = format!("PCFull{index}");
-    fonts.set(resource.as_bytes().to_vec(), Object::Ref(doc.add(Object::Dict(top))));
-    Ok(resource)
+    Ok(doc.add(Object::Dict(top)))
 }
 
 #[cfg(test)]

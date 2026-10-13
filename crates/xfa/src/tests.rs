@@ -1941,3 +1941,55 @@ fn bmp_pictures_are_decoded_even_without_a_pixel_offset() {
     assert!(crate::image::decode(&huge).unwrap_err().contains("million pixels"));
     assert!(crate::image::decode(&tiny_bmp(u32::MAX, 2, 0, &pixels)).is_err());
 }
+
+/// An element that names a prototype (`use`, `usehref`) has the prototype's attributes and
+/// children, and what it declares itself wins; text mixed with elements keeps its order.
+#[test]
+fn prototypes_give_what_references_them_their_properties() {
+    let xml = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb" w="500pt">
+<proto><subform name="styles"><field name="Line" w="200pt" h="20pt"><ui><textEdit><comb numberOfCells="5"/></textEdit></ui><font typeface="Courier New" size="9pt"/></field></subform>
+<draw id="note" w="300pt" h="14pt"><font size="7pt"/><value><text>inherited</text></value></draw></proto>
+<field name="a" usehref=".#som($template.#subform.styles.Line)"/>
+<field name="b" usehref=".#som($template.#subform.styles.Line)" w="120pt"><ui><textEdit multiLine="1"/></ui></field>
+<draw use="#note"/>
+<draw use="#note"><value><text>own</text></value></draw>
+<draw w="300pt" h="14pt"><value><exData contentType="text/html"><body xmlns="http://www.w3.org/1999/xhtml"><p>Page <b>one</b> of two</p></body></exData></value></draw>
+</subform></template>"##;
+    let form = layout_xml(xml).unwrap();
+    let page = &form.pages[0];
+    let ws = widgets(page);
+    let w = |name: &str| *ws.iter().find(|w| w.name == name).unwrap();
+    assert_eq!((w("a").rect.w, w("a").rect.h, w("a").comb), (200.0, 20.0, Some(5)));
+    assert_eq!((w("a").face.family, w("a").face.size), (crate::text::Family::Courier, 9.0));
+    assert_eq!((w("b").rect.w, w("b").rect.h, w("b").multiline), (120.0, 20.0, true), "its own width, the prototype's height");
+    let spans: Vec<_> = page.items.iter().filter_map(|i| if let Item::Text(s) = i { Some(s) } else { None }).collect();
+    assert!(spans.iter().any(|s| s.text == "inherited" && s.face.size == 7.0));
+    assert!(spans.iter().any(|s| s.text == "own" && s.face.size == 7.0));
+    assert_eq!(texts(page).concat().split("own").last(), Some("Page one of two"));
+    // A prototype that holds a reference to itself ends at the depth limit: read as written.
+    let looped = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb" w="500pt">
+<subform id="a" name="a" layout="tb"><subform use="#a"/><draw w="100pt" h="14pt"><value><text>kept</text></value></draw></subform></subform></template>"##;
+    assert!(texts(&layout_xml(looped).unwrap().pages[0]).concat().contains("kept"));
+}
+
+/// A tab moves to the next half-inch stop; a growing field with a minimum height is that tall
+/// while it is empty; a repeating row of a table inside a wrapped container gets the
+/// instances the data holds.
+#[test]
+fn tabs_minimum_heights_and_table_rows_in_wrapped_containers() {
+    let xdp = r##"<xdp><template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb" w="500pt">
+<draw w="400pt" h="14pt"><value><text>Plain</text></value></draw>
+<draw w="400pt" h="14pt"><value><text>&#9;&#9;Tabbed</text></value></draw>
+<field name="grow" w="300pt" minH="18pt"><ui><textEdit multiLine="1"/></ui></field>
+<subform layout="lr-tb" w="500pt"><subform name="table" layout="table" columnWidths="100pt 100pt"><subform name="row" layout="row"><occur min="0" max="-1"/>
+<field name="c" h="20pt"><ui><textEdit/></ui></field><field name="d" h="20pt"><ui><textEdit/></ui></field></subform></subform></subform>
+</subform></template>
+<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><table><row><c>1</c><d/></row><row><c>2</c><d/></row></table></form></xfa:data></xfa:datasets></xdp>"##;
+    let form = layout_xml(xdp).unwrap();
+    let page = &form.pages[0];
+    let x = |text: &str| page.items.iter().find_map(|i| if let Item::Text(s) = i { (s.text == text).then_some(s.x) } else { None }).unwrap();
+    assert!((x("Tabbed") - x("Plain") - 72.0).abs() < 0.01, "{} {}", x("Tabbed"), x("Plain"));
+    let ws = widgets(page);
+    assert_eq!(ws.iter().find(|w| w.name == "grow").unwrap().rect.h, 18.0);
+    assert_eq!(ws.iter().filter(|w| w.som.ends_with(".c[0]")).count(), 2, "{:?}", ws.iter().map(|w| &w.som).collect::<Vec<_>>());
+}
