@@ -56,3 +56,13 @@ deterministic; the engine supplies them.
 
 Callouts, polygons and polylines, clouds, carets (insert/replace text), stamps, file
 attachments, rich text (`/RC`, `/DS`), and the shared named-appearance cache Acrobat writes.
+
+## Document attachments
+
+`attachments` holds the document's own attached files (the catalog's `/Names /EmbeddedFiles`
+name tree), as opposed to the file a File Attachment comment carries: `document_attachments`
+lists them, `read_document_attachment` returns one's bytes within a cap,
+`set_document_attachment` adds one or replaces the one of that name, and
+`remove_document_attachment` takes one out. A change writes the tree again as one sorted leaf
+and keeps the file specifications that stay as they are; a tree of more than 10 000 entries is
+left alone. The engine uses it for what an XFA form's scripts attach.

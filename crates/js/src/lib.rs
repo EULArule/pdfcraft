@@ -159,6 +159,15 @@ pub enum Request {
     Beep,
     /// `app.execMenuItem("SaveAs")` (XFA forms' Save buttons).
     SaveAs,
+    /// An XFA click script's `importDataObject(name)`: it stopped to have a file chosen. The
+    /// click at `som` is run again with the file (or with none, when the choice is cancelled).
+    ImportDataObject {
+        name: String,
+        som: String,
+    },
+    /// An XFA click script's `exportDataObject(name)`: save the document's attachment of that
+    /// name where the user says. Never opened or run.
+    ExportDataObject(String),
 }
 
 /// What running a script did.

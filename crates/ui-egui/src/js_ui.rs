@@ -67,6 +67,17 @@ impl PdfCraftApp {
                     &[("u", &u)],
                 ),
                 Request::SaveAs => self.run_command("file.save_as"),
+                Request::ImportDataObject { name, som } => self.import_for_script(id, name, som),
+                Request::ExportDataObject(name) => {
+                    // The document's attachment of that name, saved where the user says.
+                    use pdfcraft_render::AttachmentSource;
+                    let index = self.session.get(id).and_then(|d| {
+                        d.info.attachments.iter().position(|a| matches!(&a.source, AttachmentSource::Document { key } if *key == name))
+                    });
+                    if let Some(index) = index {
+                        self.attachment_action(id, index, false);
+                    }
+                }
                 Request::Focus(_) | Request::Beep | Request::Reset(_) => {}
             }
         }
@@ -81,7 +92,13 @@ impl PdfCraftApp {
         if !self.commit_form_typing() {
             return;
         }
-        match self.session.run_javascript(id, script, Some(field)) {
+        let ran = self.session.run_javascript(id, script, Some(field));
+        self.after_button_script(id, field, ran);
+    }
+
+    /// Show what a button's script did to document `id`, and act on what it asked for.
+    fn after_button_script(&mut self, id: DocId, field: &str, ran: Result<pdfcraft_engine::js::Outcome, pdfcraft_engine::EditError>) {
+        match ran {
             Ok(o) => {
                 if let Some(i) = self.views.iter().position(|v| v.id == id)
                     && let Some(info) = self.session.get(id).map(|d| d.info.clone())
@@ -92,6 +109,30 @@ impl PdfCraftApp {
                 self.handle_js(id, out);
             }
             Err(e) => self.notify_fmt("{field}: {e}", &[("field", field), ("e", &e.to_string())]),
+        }
+    }
+
+    /// A form's click script asked for a file (`importDataObject`): ask which (or take
+    /// `attach_override`), then run the click at `som` again with it. Closing the picker
+    /// leaves the form as it was.
+    fn import_for_script(&mut self, id: DocId, name: String, som: String) {
+        let run = move |app: &mut Self, file: String, data: Vec<u8>| {
+            let import = pdfcraft_engine::ScriptImport { name, file: Some((file, std::sync::Arc::new(data))) };
+            let ran = app.session.xfa_click(id, som.clone(), Some(import));
+            app.after_button_script(id, &som, ran);
+        };
+        match self.attach_override.take() {
+            Some((file, data)) => run(self, file, data),
+            #[cfg(not(target_arch = "wasm32"))]
+            None => {
+                let dialog = rfd::AsyncFileDialog::new().set_title(tl!("Attach a file"));
+                self.ask_one(crate::pickers::Ask::File(dialog), Some(id), move |app, p| match std::fs::read(&p) {
+                    Ok(data) => run(app, p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), data),
+                    Err(e) => app.notify_fmt("Couldn't read {name}: {e}", &[("name", &p.display().to_string()), ("e", &e.to_string())]),
+                });
+            }
+            #[cfg(target_arch = "wasm32")]
+            None => {}
         }
     }
 

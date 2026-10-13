@@ -139,10 +139,16 @@ let form = pdfcraft_xfa::layout_xml(template_xml)?;       // pages of items, for
   `xfa.host` messages, reset, print, focus and URLs, `xfa.layout` page numbers, `xfa.event`);
   script objects by name (`checks.validate()`; each is evaluated in its own scope when a script
   first names it, in every script afresh, so what one script stores in a script object's
-  variables is gone for the next; FormCalc script objects and paths through `variables` are
-  not reached), `xfa.layout.pageContent` (the first page answers for the whole form) and
-  `event.target.resetForm`; not attachments (`createDataObject`, `importDataObject` and
-  `exportDataObject` do nothing and say so in the console), which page an object is on
+  variables is gone for the next; also as `variables.checks` and `subform.variables.checks`;
+  FormCalc script objects are not reached), `xfa.layout.pageContent` (the first page answers
+  for the whole form), `event.target.resetForm`, and the document's attachments through
+  `event.target` (`dataObjects`, `createDataObject`, `removeDataObject`, `getDataObject`,
+  `getDataObjectContents`, `setDataObjectContents`, with `util.stringFromStream` and
+  `util.streamFromString` in UTF-8, UTF-16 and Latin-1: what a script attaches or removes is
+  part of the event's undo step; `importDataObject` stops a click script, the user chooses a
+  file, and the click runs again with it, one file per click; `exportDataObject` asks for the
+  attachment to be saved where the user says and never opens it; 16 MB per attachment); not
+  which page an object is on
   (`xfa.layout.page` answers 1),
   not `xfa.template`, data descriptions, `xfa.connectionSet`, `border`/`font`/`ui` properties
   (reads give a sink that accepts writes), `execEvent`, or the change event per keystroke.

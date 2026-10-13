@@ -684,6 +684,9 @@ pub struct Template {
     /// The complete faces the form carries for its typefaces, which its text is set in (none
     /// for a template read on its own).
     pub fonts: crate::text::Fonts,
+    /// Some script names the document's attachments (`createDataObject`, `dataObjects`, …):
+    /// they are read for the scripts only then.
+    pub uses_attachments: bool,
 }
 
 /// A named script of a `<variables>` element.

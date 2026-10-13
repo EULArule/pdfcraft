@@ -180,6 +180,36 @@ impl Session {
         self.docs.iter_mut().find(|d| d.id == id).map(|d| std::mem::take(&mut d.js_output)).unwrap_or_default()
     }
 
+    /// Run the click script of the XFA object at `som` as one undoable step. `import` answers
+    /// the file an earlier run asked for ([`Request::ImportDataObject`]): the file chosen, or
+    /// none when the choice was cancelled.
+    pub fn xfa_click(&mut self, id: DocId, som: String, import: Option<crate::ScriptImport>) -> Result<Outcome, EditError> {
+        if self.js_off {
+            return Err(EditError::Invalid("JavaScript is turned off (Preferences ▸ JavaScript)".into()));
+        }
+        self.apply(id, Edit::XfaEvent { som, activity: "click".into(), import })?;
+        let out = self.take_js_output(id);
+        Ok(Outcome {
+            rc: true,
+            alerts: out.alerts,
+            console: out.console,
+            requests: out.requests,
+            error: out.errors.first().cloned(),
+            ..Default::default()
+        })
+    }
+
+    /// The bytes of the document's attachment named `name` (not a File Attachment comment's).
+    pub fn document_attachment(&self, id: DocId, name: &str) -> Result<Vec<u8>, EditError> {
+        /// Largest attachment handed out.
+        const MAX: usize = 1 << 30;
+        let doc = self.get(id).ok_or(EditError::NoDocument)?;
+        let cos =
+            pdfcraft_cos::Document::open_with_password(doc.bytes.clone(), doc.password.as_deref()).map_err(|e| EditError::Invalid(e.to_string()))?;
+        pdfcraft_annot::attachments::read_document_attachment(&cos, name, MAX)?
+            .ok_or_else(|| EditError::Invalid(format!("the document has no attachment named {name:?}")))
+    }
+
     /// Run `script` in document `id`, for a button (`target`: the field, event "Mouse Up") or
     /// the console (no target). Field changes and `resetForm` are applied as one undoable step;
     /// everything else the script asked for is returned.
@@ -194,16 +224,7 @@ impl Session {
             && let Some(tpl) = doc.xfa_template.clone()
             && let Some(som) = crate::xfa::clickable_som(&cos, &tpl, t)
         {
-            self.apply(id, Edit::XfaEvent { som, activity: "click".into() })?;
-            let out = self.take_js_output(id);
-            return Ok(Outcome {
-                rc: true,
-                alerts: out.alerts,
-                console: out.console,
-                requests: out.requests,
-                error: out.errors.first().cloned(),
-                ..Default::default()
-            });
+            return self.xfa_click(id, som, None);
         }
         let runner = JsRunner::new(&cos, &doc.name);
         let fields = pdfcraft_forms::fields(&cos);

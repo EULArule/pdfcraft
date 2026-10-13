@@ -572,15 +572,49 @@ fn request_json(r: &pdfcraft_engine::js::Request) -> Value {
         R::Focus(f) => json!({ "focus": f }),
         R::Beep => json!({ "beep": true }),
         R::SaveAs => json!({ "save_as": true }),
+        R::ImportDataObject { name, .. } => json!({ "import_file": name }),
+        R::ExportDataObject(name) => json!({ "export_attachment": name }),
     }
+}
+
+/// A file name for an attachment a script exports: its last path component, without anything
+/// that would leave the folder it is written to.
+fn export_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    let safe: String = last.chars().filter(|c| !c.is_control() && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|')).collect();
+    if safe.is_empty() || safe.chars().all(|c| c == '.') { "attachment".into() } else { safe }
 }
 
 impl Automation {
     pub(crate) fn js_run(&mut self, a: &Args) -> Result<Value> {
         let id = self.doc(a)?.id;
-        let o = self.session.run_javascript(id, a.str("script")?, a.opt_str("field")?).map_err(failed)?;
+        use pdfcraft_engine::js::Request as R;
+        let mut o = self.session.run_javascript(id, a.str("script")?, a.opt_str("field")?).map_err(failed)?;
+        // A click script that stopped to have a file chosen is run again with `import_file`.
+        let wanted = o.requests.iter().find_map(|r| if let R::ImportDataObject { name, som } = r { Some((name.clone(), som.clone())) } else { None });
+        if let (Some((name, som)), Some(path)) = (wanted, a.opt_str("import_file")?) {
+            let path = self.resolve(path, false)?;
+            let bytes = std::fs::read(&path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
+            let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let import = pdfcraft_engine::ScriptImport { name, file: Some((file, std::sync::Arc::new(bytes))) };
+            o = self.session.xfa_click(id, som, Some(import)).map_err(failed)?;
+        }
+        // Attachments the script exports are written into `export_dir`, when it is given.
+        let mut saved = Vec::new();
+        if let Some(dir) = a.opt_str("export_dir")? {
+            for name in o.requests.iter().filter_map(|r| if let R::ExportDataObject(name) = r { Some(name) } else { None }) {
+                let bytes = self.session.document_attachment(id, name).map_err(failed)?;
+                let path = self.resolve(&format!("{}/{}", dir.trim_end_matches('/'), export_file_name(name)), true)?;
+                write_atomic(&path, &bytes)?;
+                saved.push(path.to_string_lossy().into_owned());
+            }
+        }
         let reqs: Vec<Value> = o.requests.iter().map(request_json).collect();
-        Ok(json!({ "alerts": o.alerts, "console": o.console, "requests": reqs, "error": o.error, "result": o.result }))
+        let mut out = json!({ "alerts": o.alerts, "console": o.console, "requests": reqs, "error": o.error, "result": o.result });
+        if !saved.is_empty() {
+            out["exported"] = json!(saved);
+        }
+        Ok(out)
     }
 
     pub(crate) fn js_document_scripts(&self, a: &Args) -> Result<Value> {

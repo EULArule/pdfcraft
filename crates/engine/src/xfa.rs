@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pdfcraft_js::xfa::{XfaDoc, XfaEffect, XfaEvent, XfaKind, XfaNode};
+use pdfcraft_js::xfa::{XfaDataObject, XfaDoc, XfaEffect, XfaEvent, XfaImport, XfaKind, XfaNode};
 use pdfcraft_js::xfa_session::{Script, XfaSession};
 use pdfcraft_xfa::model::Template;
 use pdfcraft_xfa::{FormNode, LiveForm, NodeKind, ScriptEvent};
@@ -54,6 +54,7 @@ fn click_only(e: &XfaEffect) -> Option<&'static str> {
         XfaEffect::SaveAs => Some("save"),
         XfaEffect::LaunchUrl(_) => Some("open a link"),
         XfaEffect::SetFocus(_) => Some("move the focus"),
+        XfaEffect::ExportDataObject { .. } => Some("save an attachment"),
         _ => None,
     }
 }
@@ -95,11 +96,12 @@ pub(crate) struct Changes {
     pub values: usize,
     pub rows: usize,
     pub visibility: usize,
+    pub attachments: usize,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.values == 0 && self.rows == 0 && self.visibility == 0
+        self.values == 0 && self.rows == 0 && self.visibility == 0 && self.attachments == 0
     }
 
     /// "3 values, 1 row" — what changed, for a note.
@@ -115,6 +117,9 @@ impl Changes {
         if self.visibility > 0 {
             parts.push(n(self.visibility, "shown, hidden or locked object", "shown, hidden or locked objects"));
         }
+        if self.attachments > 0 {
+            parts.push(n(self.attachments, "added or removed attachment", "added or removed attachments"));
+        }
         parts.join(", ")
     }
 }
@@ -127,6 +132,34 @@ pub(crate) struct XfaRun<'a> {
     pub datasets: Option<pdfcraft_cos::ObjRef>,
     /// A script ran past its time limit and was abandoned: the form's scripts should stay off.
     pub ran_away: bool,
+    /// The file chosen (or not) for the `importDataObject` an earlier run of this click asked
+    /// for.
+    pub import: Option<XfaImport>,
+    /// The PDF date attachments the scripts create are stamped with.
+    pub date: Option<String>,
+}
+
+/// Most attachment bytes handed to the scripts of one event.
+const MAX_ATTACHMENT_BYTES: usize = 64 << 20;
+
+/// The document's attachments as scripts see them: every one by name and size, with its bytes
+/// while they fit the budgets (one too large is listed, and can't be read).
+fn data_objects(doc: &pdfcraft_cos::Document) -> Vec<XfaDataObject> {
+    let mut budget = MAX_ATTACHMENT_BYTES;
+    pdfcraft_annot::attachments::document_attachments(doc)
+        .into_iter()
+        .take(pdfcraft_js::xfa::MAX_OBJECTS)
+        .map(|a| {
+            let data = pdfcraft_annot::attachments::read_document_attachment(doc, &a.name, pdfcraft_js::xfa::MAX_DATA.min(budget)).ok().flatten();
+            budget = budget.saturating_sub(data.as_ref().map_or(0, Vec::len));
+            XfaDataObject {
+                size: data.as_ref().map(Vec::len).or(a.size).unwrap_or(0),
+                name: a.name,
+                mime: a.mime.unwrap_or_default(),
+                data: data.map(Arc::new),
+            }
+        })
+        .collect()
 }
 
 fn to_js(n: &FormNode) -> XfaNode {
@@ -306,8 +339,16 @@ impl<'a, 'b> Runner<'a, 'b> {
     fn session(&mut self) -> &mut XfaSession {
         if self.session.is_none() {
             let script_objects = self.tpl.script_objects.iter().filter(|o| !o.formcalc).map(|o| (o.name.clone(), o.text.clone())).collect();
-            let doc_info =
-                XfaDoc { file_name: String::new(), page: 0, page_count: self.run.page_count, script_objects: std::sync::Arc::new(script_objects) };
+            // Attachments are read only for a form whose scripts name them.
+            let attachments = if self.tpl.uses_attachments { data_objects(self.doc) } else { Vec::new() };
+            let doc_info = XfaDoc {
+                file_name: String::new(),
+                page: 0,
+                page_count: self.run.page_count,
+                script_objects: std::sync::Arc::new(script_objects),
+                data_objects: Arc::new(attachments),
+                import: self.run.import.clone(),
+            };
             self.session = Some(XfaSession::new(doc_info));
         }
         self.session.get_or_insert_with(|| XfaSession::new(XfaDoc::default()))
@@ -612,9 +653,28 @@ impl<'a, 'b> Runner<'a, 'b> {
                 XfaEffect::Beep => self.run.out.requests.push(Request::Beep),
                 XfaEffect::Recalculate => {}
                 XfaEffect::Relayout => relayout = true,
+                XfaEffect::SetDataObject { name, mime, data } => {
+                    let mime = Some(mime.as_str()).filter(|m| !m.is_empty());
+                    match pdfcraft_annot::attachments::set_document_attachment(self.doc, name, data, mime, self.run.date.as_deref()) {
+                        Ok(()) => self.attachments_changed(),
+                        Err(e) => self.error(format!("{} ({}): {e}", ev.som, ev.activity)),
+                    }
+                }
+                XfaEffect::RemoveDataObject { name } => match pdfcraft_annot::attachments::remove_document_attachment(self.doc, name) {
+                    Ok(true) => self.attachments_changed(),
+                    Ok(false) => {}
+                    Err(e) => self.error(format!("{} ({}): {e}", ev.som, ev.activity)),
+                },
+                XfaEffect::ExportDataObject { name } => self.run.out.requests.push(Request::ExportDataObject(name.clone())),
             }
         }
         Ok(relayout)
+    }
+
+    /// The document's attachments changed: the next script gets an engine that has them.
+    fn attachments_changed(&mut self) {
+        self.changes.attachments += 1;
+        self.session = None;
     }
 
     /// Run one event script against the form as it is now. `None`: it was skipped (the
@@ -646,6 +706,18 @@ impl<'a, 'b> Runner<'a, 'b> {
         self.console(o.console.iter().cloned());
         for n in &o.notes {
             self.error(format!("{} ({}): {n}", ev.som, ev.activity));
+        }
+        // The script stopped to have a file chosen: nothing it did is kept, the front end is
+        // asked for the file, and the click is run again with the answer.
+        if let Some(name) = &o.import_wanted {
+            if ev.activity == "click" && self.run.import.is_none() {
+                self.run.out.requests.push(Request::ImportDataObject { name: name.clone(), som: ev.som.clone() });
+            } else if ev.activity == "click" {
+                self.error(format!("{} (click): the script asked for a second file ({name:?}); one file can be chosen per click", ev.som));
+            } else {
+                self.error(format!("{} ({}): a script may only ask for a file when a button is clicked; ignored", ev.som, ev.activity));
+            }
+            return Ok(Some(o));
         }
         if let Some(e) = &o.error {
             self.error(format!("{} ({}): {e}", ev.som, ev.activity));

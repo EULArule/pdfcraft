@@ -384,6 +384,49 @@ mod xfa_model {
         assert_eq!(o.effects, vec![XfaEffect::SetValue { som: "form1[0].page1[0].total[0]".into(), value: "5".into() }]);
     }
 
+    /// `event.target` is the document for its attachments: scripts work on a copy of the list
+    /// and what they attach or remove comes back as effects.
+    #[test]
+    fn scripts_list_create_read_remove_import_and_export_attachments() {
+        use crate::xfa::{XfaDataObject, XfaImport};
+        let run = |script: &str, import: Option<XfaImport>| {
+            let ev = XfaEvent { activity: "click".into(), target: "form1[0].page1[0].go[0]".into(), ..Default::default() };
+            let kept = XfaDataObject { name: "kept.txt".into(), mime: "text/plain".into(), size: 2, data: Some(std::sync::Arc::new(b"ok".to_vec())) };
+            let doc = XfaDoc { page_count: 3, data_objects: std::sync::Arc::new(vec![kept]), import, ..Default::default() };
+            run_xfa(script, &ev, &doc, &form(), Limits::default())
+        };
+        let o = run(
+            "var d = event.target; d.createDataObject('a.xml', 'h\u{e9}'); var n = d.dataObjects.length; \
+             var t = util.stringFromStream(d.getDataObjectContents('a.xml')); d.removeDataObject('kept.txt'); d.removeDataObject('none'); \
+             d.exportDataObject({cName: 'a.xml', nLaunch: 2}); n + '/' + t + '/' + d.dataObjects.length + '/' + d.getDataObject('a.xml').size",
+            None,
+        );
+        assert_eq!((o.error, o.result.as_deref()), (None, Some("2/h\u{e9}/1/3")));
+        assert_eq!(
+            o.effects,
+            vec![
+                XfaEffect::SetDataObject { name: "a.xml".into(), mime: String::new(), data: std::sync::Arc::new("h\u{e9}".as_bytes().to_vec()) },
+                XfaEffect::RemoveDataObject { name: "kept.txt".into() },
+                XfaEffect::ExportDataObject { name: "a.xml".into() },
+            ]
+        );
+        assert!(run("event.target.getDataObjectContents('none')", None).error.is_some());
+        let named = run("event.target.createDataObject({cName: 'b.txt', cValue: 'x', cMIMEType: 'text/plain'})", None);
+        assert_eq!(
+            named.effects,
+            vec![XfaEffect::SetDataObject { name: "b.txt".into(), mime: "text/plain".into(), data: std::sync::Arc::new(b"x".to_vec()) }]
+        );
+        // A file can't be chosen while a script runs: it stops, nothing it did is reported, and
+        // it runs again with the file chosen (or none).
+        let take = "var d = event.target; qty.rawValue = 9; d.importDataObject('in') ? util.stringFromStream(d.getDataObjectContents('in')) : 'no'";
+        let o = run(take, None);
+        assert_eq!((o.import_wanted.as_deref(), o.error.is_some()), (Some("in"), true));
+        let file = XfaDataObject { name: "in".into(), mime: "text/plain".into(), size: 2, data: Some(std::sync::Arc::new(b"hi".to_vec())) };
+        let o = run(take, Some(XfaImport { name: "in".into(), file: Some(file) }));
+        assert_eq!((o.import_wanted, o.error, o.result.as_deref()), (None, None, Some("hi")));
+        assert_eq!(run(take, Some(XfaImport { name: "in".into(), file: None })).result.as_deref(), Some("no"));
+    }
+
     /// A form's script objects are libraries its event scripts call by name.
     #[test]
     fn script_objects_are_reached_by_name_and_evaluated_when_first_used() {
@@ -404,6 +447,9 @@ mod xfa_model {
         };
         let o = run("checks.over(qty.rawValue) + ':' + checks.twice(21) + ':' + checks.limit + ':' + typeof checks.missing");
         assert_eq!((o.error, o.result.as_deref()), (None, Some("true:42:3:undefined")));
+        // The same objects by where they are declared.
+        let o = run("variables.checks.twice(2) + ':' + this.parent.variables.helpers.double(4)");
+        assert_eq!((o.error, o.result.as_deref()), (None, Some("4:8")));
         // A script that names no script object never evaluates one, so a broken one harms
         // only the scripts that use it.
         assert_eq!(run("qty.rawValue").result.as_deref(), Some("4"));

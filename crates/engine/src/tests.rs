@@ -2818,6 +2818,36 @@ fn an_xfa_forms_own_font_draws_values_and_captions_in_its_script() {
     assert!(page_texts(&s, id)[0].contains("Иван") && page_texts(&s, id)[0].contains("Добави"), "{:?}", page_texts(&s, id));
 }
 
+/// A form's click scripts attach files to the document (one undoable step), take a file the
+/// user chooses, and ask for an attachment to be saved.
+#[test]
+fn xfa_click_scripts_attach_import_and_export_files() {
+    let xdp = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">
+<field name="got" w="3in" h="0.3in"><ui><textEdit/></ui></field>
+<field name="make" w="2in" h="0.3in"><ui><button/></ui><event activity="click"><script contentType="application/x-javascript">event.target.createDataObject("out.xml", "&lt;a/&gt;", "text/xml");</script></event></field>
+<field name="take" w="2in" h="0.3in"><ui><button/></ui><event activity="click"><script contentType="application/x-javascript">var d = event.target; if (d.importDataObject("in")) { got.rawValue = util.stringFromStream(d.getDataObjectContents("in")); d.removeDataObject("in"); }</script></event></field>
+<field name="give" w="2in" h="0.3in"><ui><button/></ui><event activity="click"><script contentType="application/x-javascript">event.target.exportDataObject("out.xml");</script></event></field>
+</subform></template>"##;
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("form.pdf", None, Arc::new(pdfcraft_xfa::fixtures::shell(xdp)), None).expect("opens");
+    let attached = |s: &Session| s.get(id).unwrap().info.attachments.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
+    assert_eq!(s.run_javascript(id, "", Some("make")).unwrap().error, None);
+    assert_eq!(attached(&s), ["out.xml"]);
+    assert_eq!(s.document_attachment(id, "out.xml").unwrap(), b"<a/>");
+    s.undo(id).unwrap();
+    assert!(attached(&s).is_empty());
+    s.redo(id).unwrap();
+    // The script stops for a file; the click runs again with the one chosen.
+    let asked = s.run_javascript(id, "", Some("take")).unwrap();
+    let js::Request::ImportDataObject { name, som } = asked.requests.first().cloned().expect("asks for a file") else { panic!("{asked:?}") };
+    assert_eq!((name.as_str(), asked.error), ("in", None));
+    let file = ScriptImport { name, file: Some(("notes.txt".into(), Arc::new(b"hello".to_vec()))) };
+    assert_eq!(s.xfa_click(id, som, Some(file)).unwrap().error, None);
+    assert_eq!(s.get(id).unwrap().form.iter().find(|f| f.name == "got").unwrap().value, ["hello"]);
+    assert_eq!(attached(&s), ["out.xml"], "the script removed what it imported");
+    assert_eq!(s.run_javascript(id, "", Some("give")).unwrap().requests, [js::Request::ExportDataObject("out.xml".into())]);
+}
+
 #[test]
 fn an_xfa_form_without_a_template_opens_with_its_placeholder_and_a_warning() {
     let bytes = Arc::new(pdfcraft_xfa::fixtures::shell("<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"></xdp:xdp>"));

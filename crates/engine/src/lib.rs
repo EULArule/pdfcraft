@@ -1023,6 +1023,25 @@ impl Protection {
     }
 }
 
+/// The answer to a form script's `importDataObject(name)`: the file chosen, as its file name
+/// and bytes, or `None` when the choice was cancelled.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptImport {
+    pub name: String,
+    pub file: Option<(String, Arc<Vec<u8>>)>,
+}
+
+/// The media type of a file a script imports, from its extension (what forms import: text).
+fn import_media_type(file_name: &str) -> &'static str {
+    match file_name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref() {
+        Some("txt" | "csv" | "tsv") => "text/plain",
+        Some("xml" | "xfdf" | "xdp") => "text/xml",
+        Some("json") => "application/json",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Edits that can be applied to a document. Page indices are 0-based.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Edit {
@@ -1306,9 +1325,12 @@ pub enum Edit {
     },
     /// An XFA form's scripted event (a button's `click`, say) on the object at `som`: what the
     /// script changes (values, rows, visibility) is applied and the form laid out again.
+    /// `import` answers the file a click script asked for (`importDataObject`) when the event
+    /// ran before: the click is run again with it.
     XfaEvent {
         som: String,
         activity: String,
+        import: Option<ScriptImport>,
     },
     /// Scan & OCR ▸ Recognize text: put recognised words on `page` as invisible text over the
     /// image (from [`ocr::OcrJob::run`]).
@@ -2141,9 +2163,26 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -> 
             Some(js) => pdfcraft_forms::apply_script_changes(doc, changes, js)?,
             None => pdfcraft_forms::apply_script_changes(doc, changes, &mut pdfcraft_forms::NoScripts)?,
         },
-        Edit::XfaEvent { som, activity } => {
+        Edit::XfaEvent { som, activity, import } => {
             let tpl = cx.xfa.clone().ok_or_else(|| EditError::Invalid("this is not a laid-out XFA form, or JavaScript is off".into()))?;
-            let mut run = xfa::XfaRun { page_count: cx.pages, out: &mut cx.xfa_out, datasets: cx.xfa_datasets, ran_away: false };
+            let import = match import {
+                Some(ScriptImport { name, file: Some((file_name, bytes)) }) => {
+                    if bytes.len() > pdfcraft_js::xfa::MAX_DATA {
+                        return Err(EditError::Invalid(format!("{file_name} is larger than 16 MB, the most a form's script may import")));
+                    }
+                    let file = pdfcraft_js::xfa::XfaDataObject {
+                        name: name.clone(),
+                        mime: import_media_type(file_name).into(),
+                        size: bytes.len(),
+                        data: Some(Arc::clone(bytes)),
+                    };
+                    Some(pdfcraft_js::xfa::XfaImport { name: name.clone(), file: Some(file) })
+                }
+                Some(ScriptImport { name, file: None }) => Some(pdfcraft_js::xfa::XfaImport { name: name.clone(), file: None }),
+                None => None,
+            };
+            let mut run =
+                xfa::XfaRun { page_count: cx.pages, out: &mut cx.xfa_out, datasets: cx.xfa_datasets, ran_away: false, import, date: cx.date.clone() };
             let ran = xfa::on_event(doc, &tpl, som, activity, &mut run);
             cx.xfa_datasets = run.datasets;
             cx.xfa_ran_away |= run.ran_away;
@@ -2776,7 +2815,8 @@ fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
 /// fields take the data's values.
 fn xfa_after_data_change(doc: &mut pdfcraft_cos::Document, cx: &mut EditCtx, calculate: bool) -> Result<(), EditError> {
     if let Some(tpl) = cx.xfa.clone() {
-        let mut run = xfa::XfaRun { page_count: cx.pages, out: &mut cx.xfa_out, datasets: cx.xfa_datasets, ran_away: false };
+        let mut run =
+            xfa::XfaRun { page_count: cx.pages, out: &mut cx.xfa_out, datasets: cx.xfa_datasets, ran_away: false, import: None, date: None };
         let r = guard(|| xfa::on_data_replaced(doc, &tpl, calculate, &mut run))
             .unwrap_or_else(|m| Err(format!("laying the form out again failed unexpectedly ({m})")));
         cx.xfa_datasets = run.datasets;
@@ -3026,7 +3066,8 @@ impl Session {
                     let mut work = cos.clone();
                     let pages = info.pages.len();
                     let ran = guard(|| {
-                        let mut run = xfa::XfaRun { page_count: pages, out: &mut script_output, datasets: None, ran_away: false };
+                        let mut run =
+                            xfa::XfaRun { page_count: pages, out: &mut script_output, datasets: None, ran_away: false, import: None, date: None };
                         let changes = xfa::on_open(&mut work, &tpl, &mut run);
                         if run.ran_away {
                             ran_away = true;
@@ -3281,7 +3322,8 @@ impl Session {
             let mut reset = false;
             collect(&edit, &mut changed, &mut reset);
             if !changed.is_empty() || reset {
-                let mut run = xfa::XfaRun { page_count: cx.pages, out: &mut cx.xfa_out, datasets: cx.xfa_datasets, ran_away: false };
+                let mut run =
+                    xfa::XfaRun { page_count: cx.pages, out: &mut cx.xfa_out, datasets: cx.xfa_datasets, ran_away: false, import: None, date: None };
                 // Every changed field's scripts, then the calculations once (after a reset,
                 // only those).
                 let ran = guard(|| xfa::on_changes(&mut next, &tpl, &changed, &mut run))

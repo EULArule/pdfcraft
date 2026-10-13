@@ -17,6 +17,9 @@ use boa_engine::{Context, JsObject, JsResult, JsString, JsValue, NativeFunction,
 
 use crate::{Limits, arg, as_number, error, function, platform, printd, printf, printx, refuse, s, text};
 
+mod data_objects;
+pub use data_objects::{MAX_DATA, MAX_OBJECTS, XfaDataObject, XfaImport};
+
 /// What kind of template object a node is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XfaKind {
@@ -87,6 +90,11 @@ pub struct XfaDoc {
     /// The form's JavaScript script objects, name and source: every script can call their
     /// functions as `name.function()`. Each is evaluated when a script first names it.
     pub script_objects: std::sync::Arc<Vec<(String, String)>>,
+    /// The document's attachments, which scripts list, read, replace and remove.
+    pub data_objects: std::sync::Arc<Vec<XfaDataObject>>,
+    /// The file chosen (or not) for the `importDataObject` an earlier run of this event asked
+    /// for.
+    pub import: Option<XfaImport>,
 }
 
 /// Something a script changed or asked for.
@@ -124,6 +132,20 @@ pub enum XfaEffect {
     Recalculate,
     /// `xfa.form.remerge()`, `xfa.layout.relayout()`.
     Relayout,
+    /// `createDataObject`, `setDataObjectContents`, or a file taken by `importDataObject`:
+    /// the document gets this attachment, in place of one of the same name.
+    SetDataObject {
+        name: String,
+        mime: String,
+        data: std::sync::Arc<Vec<u8>>,
+    },
+    RemoveDataObject {
+        name: String,
+    },
+    /// `exportDataObject`: save the attachment where the user says.
+    ExportDataObject {
+        name: String,
+    },
 }
 
 /// What running a script did.
@@ -143,6 +165,9 @@ pub struct XfaOutcome {
     /// The script ran past its time limit and was left running on its own thread (the engine
     /// can't interrupt it): the caller should run no more of this form's scripts.
     pub abandoned: bool,
+    /// The script called `importDataObject` with this name and stopped there (its `error` says
+    /// so): once a file has been chosen, the event is run again with [`XfaDoc::import`] set.
+    pub import_wanted: Option<String>,
 }
 
 /// Most nodes a snapshot may hold.
@@ -216,6 +241,11 @@ pub(crate) struct XHost {
     pub(crate) effects: Vec<XfaEffect>,
     pub(crate) console: Vec<String>,
     pub(crate) doc: XfaDoc,
+    /// The document's attachments as this script has left them.
+    pub(crate) data_objects: Vec<XfaDataObject>,
+    /// Bytes attached by this script.
+    pub(crate) attached: usize,
+    pub(crate) import_wanted: Option<String>,
     added: usize,
     /// Index of `this`.
     pub(crate) current: usize,
@@ -245,6 +275,9 @@ impl XHost {
             effects: Vec::new(),
             console: Vec::new(),
             doc: doc.clone(),
+            data_objects: doc.data_objects.iter().take(MAX_OBJECTS).cloned().collect(),
+            attached: 0,
+            import_wanted: None,
             added: 0,
             current,
             set_at: HashMap::new(),
@@ -889,13 +922,20 @@ fn node_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         },
         "resolveNode" => resolver(ctx, idx, false)?,
         "resolveNodes" => resolver(ctx, idx, true)?,
+        // The script objects, wherever the form declares them (the names are kept apart).
+        "variables" => ctx.global_object().get(js_string!("__xfa_variables"), ctx)?,
         "recalculate" => function(ctx, NativeFunction::from_fn_ptr(recalculate)).into(),
         // `event.target` is the node here and the document in Acrobat: what forms ask the
-        // document for. Attachments are not reachable from a form's scripts.
+        // document for, its attachments among it.
         "resetForm" => function(ctx, NativeFunction::from_fn_ptr(doc_reset_form)).into(),
-        "dataObjects" => JsValue::null(),
-        "removeDataObject" => function(ctx, NativeFunction::from_fn_ptr(noop)).into(),
-        "createDataObject" | "importDataObject" | "exportDataObject" => function(ctx, NativeFunction::from_fn_ptr(data_object_unsupported)).into(),
+        "dataObjects" => data_objects::list(ctx)?,
+        "createDataObject" => function(ctx, NativeFunction::from_fn_ptr(data_objects::create)).into(),
+        "removeDataObject" => function(ctx, NativeFunction::from_fn_ptr(data_objects::remove)).into(),
+        "getDataObject" => function(ctx, NativeFunction::from_fn_ptr(data_objects::get)).into(),
+        "getDataObjectContents" => function(ctx, NativeFunction::from_fn_ptr(data_objects::contents)).into(),
+        "setDataObjectContents" => function(ctx, NativeFunction::from_fn_ptr(data_objects::set_contents)).into(),
+        "importDataObject" => function(ctx, NativeFunction::from_fn_ptr(data_objects::import)).into(),
+        "exportDataObject" => function(ctx, NativeFunction::from_fn_ptr(data_objects::export)).into(),
         "remerge" => function(ctx, NativeFunction::from_fn_ptr(relayout)).into(),
         "getAttribute"
         | "setAttribute"
@@ -1162,18 +1202,9 @@ fn doc_reset_form(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
     Ok(JsValue::undefined())
 }
 
-/// `event.target.createDataObject(name, text)` and its kin: a form attaching a file it made (a
-/// report, the data as XML) to the document. Not done yet; said in the console, never silently.
-fn data_object_unsupported(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let name = clip(text(&arg(args, 0), ctx)?);
-    host(ctx)?.borrow_mut().print(format!(
-        "The form asked to attach or read the file \"{name}\"; PdfCraft does not let a form's scripts do that yet, so it was not done"
-    ));
-    Ok(JsValue::from(false))
-}
-
 /// Evaluates each script object when a script first names it, in a scope of its own: its
-/// functions and variables are reached through the object, as `name.function()`.
+/// functions and variables are reached through the object, as `name.function()`, also as
+/// `variables.name.function()` and through any subform's `variables`.
 const SCRIPT_OBJECTS: &[u8] = br#"(function (g, sources) {
     function load(__xfa_source) {
         eval(__xfa_source);
@@ -1204,6 +1235,13 @@ const SCRIPT_OBJECTS: &[u8] = br#"(function (g, sources) {
             }
         });
     });
+    // `variables.name` and `subform.variables.name`: the same objects, by where they are declared.
+    var variables = {};
+    Object.keys(sources).forEach(function (name) {
+        Object.defineProperty(variables, name, { enumerable: true, get: function () { return g[name]; } });
+    });
+    Object.defineProperty(g, "__xfa_variables", { value: variables });
+    if (!("variables" in g)) { Object.defineProperty(g, "variables", { configurable: true, writable: true, value: variables }); }
 })(this, __xfa_objects)"#;
 
 fn zero(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
@@ -1326,6 +1364,8 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
         .function(NativeFunction::from_fn_ptr(printf), js_string!("printf"), 1)
         .function(NativeFunction::from_fn_ptr(printd), js_string!("printd"), 2)
         .function(NativeFunction::from_fn_ptr(printx), js_string!("printx"), 2)
+        .function(NativeFunction::from_fn_ptr(data_objects::string_from_stream), js_string!("stringFromStream"), 2)
+        .function(NativeFunction::from_fn_ptr(data_objects::stream_from_string), js_string!("streamFromString"), 2)
         .build();
     ctx.register_global_property(js_string!("util"), util, rw)?;
     // Unqualified names: the current node's children, its siblings, then each ancestor's
@@ -1621,6 +1661,7 @@ pub(crate) fn run_here(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNo
     if let Some(h) = ctx.remove_data::<Shared>() {
         let h = h.into_inner();
         out.notes = h.notes();
+        out.import_wanted = h.import_wanted;
         out.effects = h.effects;
         out.console = h.console;
     }

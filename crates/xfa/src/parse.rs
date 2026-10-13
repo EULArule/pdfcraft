@@ -717,7 +717,8 @@ pub fn parse(xml: &str) -> Result<(Template, Vec<String>), XfaError> {
             script_objects.push(ScriptObject { name: name.to_string(), text: parsed.text, formcalc: parsed.formcalc });
         }
     }
-    Ok((Template { root: root_sf, script_objects, page_roles, fonts: Default::default() }, warnings))
+    let uses_attachments = xml.contains("DataObject");
+    Ok((Template { root: root_sf, script_objects, page_roles, fonts: Default::default(), uses_attachments }, warnings))
 }
 
 fn parse_access(a: Option<&str>) -> Option<Access> {

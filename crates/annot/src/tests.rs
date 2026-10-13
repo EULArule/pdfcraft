@@ -1268,3 +1268,24 @@ fn cached_appearances_are_reused_while_annotations_are_unchanged() {
     assert!(!a.is_empty());
     assert_eq!(a, b, "the reused appearance is byte-identical");
 }
+
+/// The document's attachments are added, replaced, read and removed by name, and stay a sorted
+/// name tree a reader finds them in.
+#[test]
+fn document_attachments_are_set_read_and_removed_by_name() {
+    use crate::attachments::{document_attachments, read_document_attachment, remove_document_attachment, set_document_attachment};
+    let mut doc = fixture();
+    set_document_attachment(&mut doc, "report.txt", b"first", Some("text/plain"), None).unwrap();
+    set_document_attachment(&mut doc, "data.xml", b"<a/>", None, None).unwrap();
+    set_document_attachment(&mut doc, "report.txt", b"second", Some("text/plain"), None).unwrap();
+    let mut doc = reopen(&doc);
+    let listed: Vec<_> = document_attachments(&doc).into_iter().map(|a| (a.name, a.size, a.mime)).collect();
+    assert_eq!(listed, [("data.xml".to_string(), Some(4), None), ("report.txt".to_string(), Some(6), Some("text/plain".to_string()))]);
+    assert_eq!(read_document_attachment(&doc, "report.txt", 100).unwrap().as_deref(), Some(&b"second"[..]));
+    assert!(read_document_attachment(&doc, "report.txt", 3).is_err(), "larger than the caller takes");
+    assert_eq!(read_document_attachment(&doc, "none", 100).unwrap(), None);
+    assert!(remove_document_attachment(&mut doc, "data.xml").unwrap());
+    assert!(!remove_document_attachment(&mut doc, "data.xml").unwrap());
+    assert!(set_document_attachment(&mut doc, " ", b"x", None, None).is_err(), "a name is needed");
+    assert_eq!(document_attachments(&reopen(&doc)).len(), 1);
+}

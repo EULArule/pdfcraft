@@ -17,6 +17,7 @@
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString, Stream};
 
 pub mod appearance;
+pub mod attachments;
 pub mod links;
 
 #[cfg(test)]
