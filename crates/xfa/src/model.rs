@@ -31,52 +31,6 @@ impl Presence {
     }
 }
 
-/// Which point of an object's box its `x` and `y` give (`anchorType`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Anchor {
-    #[default]
-    TopLeft,
-    TopCenter,
-    TopRight,
-    MiddleLeft,
-    MiddleCenter,
-    MiddleRight,
-    BottomLeft,
-    BottomCenter,
-    BottomRight,
-}
-
-impl Anchor {
-    pub fn parse(s: Option<&str>) -> Anchor {
-        match s.map(str::trim) {
-            Some("topCenter") => Anchor::TopCenter,
-            Some("topRight") => Anchor::TopRight,
-            Some("middleLeft") => Anchor::MiddleLeft,
-            Some("middleCenter") => Anchor::MiddleCenter,
-            Some("middleRight") => Anchor::MiddleRight,
-            Some("bottomLeft") => Anchor::BottomLeft,
-            Some("bottomCenter") => Anchor::BottomCenter,
-            Some("bottomRight") => Anchor::BottomRight,
-            _ => Anchor::TopLeft,
-        }
-    }
-
-    /// How far left of and above the anchor point the top left corner of a `w` by `h` box is.
-    pub fn offset(self, w: f64, h: f64) -> (f64, f64) {
-        let dx = match self {
-            Anchor::TopLeft | Anchor::MiddleLeft | Anchor::BottomLeft => 0.0,
-            Anchor::TopCenter | Anchor::MiddleCenter | Anchor::BottomCenter => w / 2.0,
-            Anchor::TopRight | Anchor::MiddleRight | Anchor::BottomRight => w,
-        };
-        let dy = match self {
-            Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => 0.0,
-            Anchor::MiddleLeft | Anchor::MiddleCenter | Anchor::MiddleRight => h / 2.0,
-            Anchor::BottomLeft | Anchor::BottomCenter | Anchor::BottomRight => h,
-        };
-        (dx, dy)
-    }
-}
-
 /// How a subform places its children.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -274,6 +228,36 @@ impl VAlign {
     }
 }
 
+/// Which point of a positioned object's box its `x` and `y` give (`anchorType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Anchor {
+    /// Fraction of the width left of the point: 0 left, 0.5 centre, 1 right.
+    pub h: f64,
+    /// Fraction of the height above the point: 0 top, 0.5 middle, 1 bottom.
+    pub v: f64,
+}
+
+impl Anchor {
+    pub fn parse(s: Option<&str>) -> Anchor {
+        let s = s.map(str::trim).unwrap_or("");
+        let v = if s.starts_with("middle") {
+            0.5
+        } else if s.starts_with("bottom") {
+            1.0
+        } else {
+            0.0
+        };
+        let h = if s.ends_with("Center") {
+            0.5
+        } else if s.ends_with("Right") {
+            1.0
+        } else {
+            0.0
+        };
+        Anchor { h, v }
+    }
+}
+
 /// Paragraph properties as written on an element; `None` inherits.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParaSpec {
@@ -322,7 +306,6 @@ pub struct Common {
     pub id: Option<String>,
     pub x: Option<f64>,
     pub y: Option<f64>,
-    /// The point of the box `x` and `y` give, in positioned content.
     pub anchor: Anchor,
     pub w: Option<f64>,
     pub h: Option<f64>,
@@ -346,6 +329,13 @@ pub enum Node {
     Field(Box<Field>),
     Draw(Box<Draw>),
     ExclGroup(Box<ExclGroup>),
+}
+
+impl Common {
+    /// The top-left corner of a positioned box of `w` by `h`, from `x`, `y` and the anchor.
+    pub fn top_left(&self, w: f64, h: f64) -> (f64, f64) {
+        (self.x.unwrap_or(0.0) - w * self.anchor.h, self.y.unwrap_or(0.0) - h * self.anchor.v)
+    }
 }
 
 impl Node {

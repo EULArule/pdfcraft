@@ -1,6 +1,8 @@
 //! The command registry drives menus, shortcuts and the palette: every registered command must
 //! be implemented, disabled commands must say why, and every surface must reach the same action.
 
+mod support;
+
 use egui::os::OperatingSystem;
 use egui::{Key, Modifiers};
 use egui_kittest::Harness;
@@ -184,9 +186,13 @@ fn a_tool_chosen_with_no_document_asks_for_one_and_runs_on_it() {
     h.run_steps(2);
     h.state_mut().run_command("export.text");
     assert!(h.state().toast.as_ref().is_none_or(|t| t.0 != "Open a document first"));
-    h.run_steps(3);
+    support::wait_until(&mut h, "picked document and chosen tool", |app| app.active.is_some() && matches!(app.dialog, Some(Dialog::Export(_))));
     assert!(h.state().active.is_some(), "the picked file is open");
     assert!(matches!(h.state().dialog, Some(Dialog::Export(_))), "and the tool runs on it: {:?}", h.state().dialog);
+    let (_, id) = h.state().active_ids().unwrap();
+    let doc = h.state().session.get(id).unwrap();
+    assert_eq!(doc.name, "picked.pdf");
+    assert_eq!(doc.bytes.as_slice(), fixture(2).as_slice());
     // Cancelled: nothing opens and nothing runs.
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
         let mut app = PdfCraftApp::new();
@@ -286,12 +292,16 @@ fn the_open_recent_menu_lists_files_and_opens_one() {
     h.run_steps(3);
     h.get_by_label("Open Recent ⏵").hover();
     h.run_steps(3);
+    let original = h.state().views[0].id;
     h.get_by_label_contains("recent.pdf").click();
-    h.run_steps(4);
+    support::wait_until(&mut h, "recent document", |app| app.views.len() == 2 && app.password_prompt.is_none());
     let app = h.state();
     assert_eq!(app.views.len(), 2, "the recent file opened in a new tab");
     let active = app.active.unwrap();
     assert_eq!(app.session.get(app.views[active].id).and_then(|d| d.path.as_deref()), Some(path.as_str()), "the active tab is the recent file");
+    assert_eq!(app.session.get(app.views[active].id).unwrap().bytes.as_slice(), fixture(2).as_slice());
+    assert!(app.views.iter().any(|view| view.id == original));
+    assert_eq!(app.session.get(original).unwrap().bytes.as_slice(), fixture(3).as_slice());
 }
 
 #[test]
@@ -505,4 +515,78 @@ fn command_w_still_closes_the_document_tab_on_macos() {
     h.key_press_modifiers(Modifiers::COMMAND, Key::W);
     h.run_steps(2);
     assert!(h.state().views.is_empty(), "⌘W closes the clean document tab");
+}
+
+fn palette_ime_output_requests_interrupt(h: &Harness<'_, PdfCraftApp>, phase: &str) -> bool {
+    assert!(h.state().palette_open, "palette closed during {phase}");
+    let ime = h.output().platform_output.ime.as_ref().expect("focused palette advertises IME");
+    eprintln!("{phase}: query={:?}; should_interrupt_composition={}", h.state().palette_query, ime.should_interrupt_composition);
+    ime.should_interrupt_composition
+}
+
+fn palette_ime_output_is_uninterrupted(h: &Harness<'_, PdfCraftApp>, phase: &str) {
+    assert!(!palette_ime_output_requests_interrupt(h, phase), "palette interrupted composition during {phase}");
+}
+
+#[test]
+fn palette_ime_idle_frames_and_reopen_do_not_interrupt_composition() {
+    let mut h = harness();
+    for opening in 0..2 {
+        h.state_mut().run_command("view.palette");
+        h.run_steps(3);
+        for frame in 0..3 {
+            h.step();
+            palette_ime_output_is_uninterrupted(&h, &format!("opening {opening}, idle {frame}"));
+        }
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().palette_open);
+    }
+}
+
+#[test]
+fn palette_ime_chinese_preedit_commit_and_cancel_remain_uninterrupted() {
+    let mut h = harness();
+    let mut interruptions = Vec::new();
+    h.state_mut().run_command("view.palette");
+    h.run_steps(3);
+    for preedit in ["ni", "nih"] {
+        h.event(egui::Event::Ime(egui::ImeEvent::Preedit { text: preedit.into(), active_range_chars: Some(0..preedit.chars().count()) }));
+        h.step();
+        interruptions.push(palette_ime_output_requests_interrupt(&h, preedit));
+        h.step();
+        interruptions.push(palette_ime_output_requests_interrupt(&h, "preedit idle"));
+    }
+    h.event(egui::Event::Ime(egui::ImeEvent::Commit("你".into())));
+    h.step();
+    assert_eq!(h.state().palette_query, "你");
+    interruptions.push(palette_ime_output_requests_interrupt(&h, "Chinese commit"));
+    h.run_steps(2);
+    assert_eq!(h.state().palette_query, "你");
+    interruptions.push(palette_ime_output_requests_interrupt(&h, "committed idle"));
+    h.event(egui::Event::Ime(egui::ImeEvent::Preedit { text: "hao".into(), active_range_chars: Some(0..3) }));
+    h.step();
+    interruptions.push(palette_ime_output_requests_interrupt(&h, "second preedit"));
+    h.event(egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }));
+    h.step();
+    assert_eq!(h.state().palette_query, "你");
+    interruptions.push(palette_ime_output_requests_interrupt(&h, "cancel preedit"));
+    assert!(interruptions.iter().all(|interrupt| !interrupt), "composition interrupted: {interruptions:?}");
+}
+
+#[test]
+fn palette_ime_outside_click_closes_without_running_a_command() {
+    let mut h = harness();
+    h.state_mut().set_option("palette", "rotate pages clockwise").unwrap();
+    h.run_steps(3);
+    h.event(egui::Event::PointerButton {
+        pos: egui::pos2(20.0, 850.0),
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers::NONE,
+    });
+    h.step();
+    assert!(!h.state().palette_open);
+    assert!(h.state().palette_query.is_empty());
+    assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().info.pages[0].rotation, 0);
 }

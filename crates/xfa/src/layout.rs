@@ -990,7 +990,7 @@ impl Layouter<'_> {
             Layout::Positioned => visible
                 .map(|k| {
                     let (w, h) = self.size_of(k, avail_w, ctx, depth + 1);
-                    k.common().x.unwrap_or(0.0) - k.common().anchor.offset(w, h).0 + w
+                    k.common().top_left(w, h).0 + w
                 })
                 .fold(0.0, f64::max)
                 .min(avail_w),
@@ -1112,7 +1112,7 @@ impl Layouter<'_> {
             .map(|k| {
                 let c = k.common();
                 let (w, h) = self.size_of(k, (inner_w - c.x.unwrap_or(0.0)).max(1.0), ctx, depth + 1);
-                c.y.unwrap_or(0.0) - c.anchor.offset(w, h).1 + h
+                c.top_left(w, h).1 + h
             })
             .fold(0.0, f64::max)
     }
@@ -1208,11 +1208,9 @@ impl Layouter<'_> {
         if !c.presence.occupies() {
             return Ok(());
         }
-        let (x, y) = (c.x.unwrap_or(0.0), c.y.unwrap_or(0.0));
-        let (w, h) = self.size_of(k, (inner.w - x).max(1.0), ctx, depth + 1);
-        // `x` and `y` give the anchor point, which need not be the top left corner.
-        let (dx, dy) = c.anchor.offset(w, h);
-        self.draw_node(k, Rect::new(inner.x + x - dx, inner.y + y - dy, w, h), ctx, depth + 1, sib)
+        let (w, h) = self.size_of(k, (inner.w - c.x.unwrap_or(0.0)).max(1.0), ctx, depth + 1);
+        let (x, y) = c.top_left(w, h);
+        self.draw_node(k, Rect::new(inner.x + x, inner.y + y, w, h), ctx, depth + 1, sib)
     }
 
     fn draw_node(&mut self, node: &Node, rect: Rect, ctx: &Ctx, depth: usize, sib: usize) -> Result<(), XfaError> {
@@ -1432,7 +1430,8 @@ impl Layouter<'_> {
                 .map(|(i, k)| {
                     let c = k.common();
                     let (w, h) = self.size_of(k, (inner.w - c.x.unwrap_or(0.0)).max(1.0), &ctx, depth + 1);
-                    (i, Rect::new(c.x.unwrap_or(0.0), c.y.unwrap_or(0.0), w, h))
+                    let (x, y) = c.top_left(w, h);
+                    (i, Rect::new(x, y, w, h))
                 })
                 .collect(),
             _ => self.pack(&nodes, inner.w, &ctx, depth).0,
